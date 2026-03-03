@@ -110,7 +110,7 @@
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 填写 Token（编辑 src/config.py，将 'your_tushare_token' 替换为真实 Token）
+# 2. 填写 Token（编辑 src/config_template.py，将 'your_tushare_token' 替换为真实 Token，并更改文件名为 config.py）
 
 # 3. 建库并下载数据（每股约 3 次接口：daily + daily_basic + adj_factor）
 python - <<EOF

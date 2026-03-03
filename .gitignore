@@ -6,7 +6,7 @@ Instruction.md
 .cursor/
 
 # Tushare token is stored here; must never be committed
-
+src/config.py
 
 # Generated database file (regenerate with download_data(); too large for version control)
 data/*.db

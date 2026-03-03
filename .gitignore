@@ -1,9 +1,7 @@
 # Local-only docs (never push to remote; project docs for remote will be written later)
 prompt.md
 temporary.md
-
-result.txt
-result_ml.txt
+Instruction.md
 
 .cursor/
 
@@ -13,8 +11,6 @@ src/config.py
 # Generated database file (regenerate with download_data(); too large for version control)
 data/*.db
 data/*.parquet
-
-plots/
 
 # Python
 __pycache__/

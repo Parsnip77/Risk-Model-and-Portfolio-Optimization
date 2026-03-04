@@ -1,0 +1,535 @@
+"""
+FactorEngine: compute all feature factors for the risk model.
+
+Factor groups
+-------------
+A — Microstructure and price-volume factors (use adjusted prices):
+    amihud_illiq      : Amihud (2002) illiquidity ratio, 20-day mean
+    ivol              : idiosyncratic volatility vs CSI 300, rolling 20-day OLS residual std
+    realized_skewness : rolling 20-day skewness of daily returns
+    vol_price_corr    : rolling 10-day Spearman rank correlation between price and volume
+
+B — Fundamental and valuation factors (point-in-time quarterly data):
+    ep                : earnings-to-price  (1 / PE)
+    bp                : book-to-price      (1 / PB)
+    roe               : return on equity, quarterly, PIT-aligned via ann_date
+    ocf_to_revenue    : operating cash flow / revenue, quarterly, PIT-aligned
+    net_profit_yoy    : single-quarter net profit year-over-year growth, PIT-aligned
+
+C — Cross-sectional relative features:
+    industry_rel_turnover : turnover_rate − industry cross-section median
+    industry_rel_bp       : BP − industry cross-section median
+    ts_rel_turnover       : today's turnover_rate / 60-day rolling mean
+
+Price adjustment (adj_type parameter):
+    'forward'  (default) : P × adj_factor / adj_factor_latest  (last row in df_adj)
+    'backward'           : P × adj_factor
+    'raw'                : no adjustment
+
+PIT alignment note:
+    For B-group factors, quarterly data is forward-filled from the announcement date
+    (ann_date).  merge_asof with direction='backward' ensures that for any trading
+    date t, only announcements with ann_date ≤ t are used.  No future information
+    leaks into the factor values.
+"""
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy import stats as scipy_stats
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import config
+
+
+class FactorEngine:
+    """
+    Compute all feature factors from the project data dictionary.
+
+    Parameters
+    ----------
+    data_dict : dict
+        Returned by DataEngine.load_data().  Must contain:
+            df_price, df_mv, df_basic, df_industry, df_adj,
+            df_index, df_financials
+    adj_type : str, default 'forward'
+        Price adjustment mode: 'forward' | 'backward' | 'raw'
+    latest_adj : pd.Series or None
+        Optional pre-fetched latest adj_factor values (for forward adjustment).
+        When None, the last row of df_adj is used.
+    """
+
+    def __init__(
+        self,
+        data_dict: dict,
+        adj_type: str = "forward",
+        latest_adj: pd.Series = None,
+    ):
+        if adj_type not in ("forward", "backward", "raw"):
+            raise ValueError(f"adj_type must be 'forward', 'backward', or 'raw'; got '{adj_type}'")
+
+        df_price = data_dict["df_price"]
+        df_mv    = data_dict["df_mv"]
+        df_adj   = data_dict.get("df_adj")
+        df_basic = data_dict["df_basic"]
+
+        # ---- Unstack raw price series (wide form: dates × codes) ----
+        open_raw  = df_price["open"].unstack("code")
+        high_raw  = df_price["high"].unstack("code")
+        low_raw   = df_price["low"].unstack("code")
+        close_raw = df_price["close"].unstack("code")
+        self.vol  = df_price["vol"].unstack("code")     # never adjusted
+
+        # Raw amount (千元 → 元 conversion applied inside amihud_illiq)
+        if "amount" in df_price.columns:
+            self.amount_raw = df_price["amount"].unstack("code")  # unit: 千元
+        else:
+            self.amount_raw = None
+
+        # ---- Price adjustment ----
+        if adj_type != "raw" and df_adj is not None and not df_adj.empty:
+            adj_wide = df_adj["adj_factor"].unstack("code").reindex(open_raw.index).ffill()
+            if adj_type == "forward":
+                latest_row = adj_wide.iloc[-1] if latest_adj is None else latest_adj.reindex(adj_wide.columns)
+                adj_ratio = adj_wide.div(latest_row, axis=1)
+            else:
+                adj_ratio = adj_wide
+            self.open  = open_raw.mul(adj_ratio)
+            self.high  = high_raw.mul(adj_ratio)
+            self.low   = low_raw.mul(adj_ratio)
+            self.close = close_raw.mul(adj_ratio)
+        else:
+            self.open  = open_raw
+            self.high  = high_raw
+            self.low   = low_raw
+            self.close = close_raw
+
+        self.returns  = self.close.pct_change()
+        self.total_mv = df_mv["total_mv"].unstack("code")
+
+        # ---- Daily basic fields ----
+        self.pe            = df_basic["pe"].unstack("code") if "pe" in df_basic.columns else None
+        self.pb            = df_basic["pb"].unstack("code") if "pb" in df_basic.columns else None
+        self.turnover_rate = df_basic["turnover_rate"].unstack("code") if "turnover_rate" in df_basic.columns else None
+
+        # ---- Industry mapping (code → SW L1 name) ----
+        df_industry = data_dict["df_industry"]
+        self._industry = df_industry["industry"].reindex(self.close.columns)
+
+        # ---- Index returns (for IVOL) ----
+        index_close = data_dict.get("df_index")
+        if index_close is not None and not index_close.empty:
+            index_close = index_close.reindex(self.close.index).ffill()
+            self.market_ret = index_close.pct_change()
+        else:
+            self.market_ret = pd.Series(dtype=float)
+
+        # ---- Quarterly financials (raw, for PIT alignment) ----
+        self._df_financials = data_dict.get("df_financials", pd.DataFrame())
+
+    # ==================================================================
+    # Utility functions (time-series and cross-sectional operators)
+    # ==================================================================
+
+    def _rank(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Cross-sectional rank, normalized to (0, 1]."""
+        return df.rank(axis=1, pct=True)
+
+    def _delay(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Value d days ago."""
+        return df.shift(d)
+
+    def _delta(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Change over d days."""
+        return df.diff(d)
+
+    def _corr(self, df1: pd.DataFrame, df2: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Rolling d-day time-series Pearson correlation, per stock."""
+        return df1.rolling(d).corr(df2)
+
+    def _cov(self, df1: pd.DataFrame, df2: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Rolling d-day covariance, per stock."""
+        return df1.rolling(d).cov(df2)
+
+    def _stddev(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Rolling d-day standard deviation, per stock."""
+        return df.rolling(d).std()
+
+    def _sum(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Rolling d-day sum, per stock."""
+        return df.rolling(d).sum()
+
+    def _product(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Rolling d-day product, per stock."""
+        return df.rolling(d).apply(np.prod, raw=True)
+
+    def _ts_min(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Rolling d-day minimum, per stock."""
+        return df.rolling(d).min()
+
+    def _ts_max(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Rolling d-day maximum, per stock."""
+        return df.rolling(d).max()
+
+    def _ts_argmax(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """0-based offset of rolling maximum over d days."""
+        return df.rolling(d).apply(np.argmax, raw=True)
+
+    def _ts_argmin(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """0-based offset of rolling minimum over d days."""
+        return df.rolling(d).apply(np.argmin, raw=True)
+
+    def _ts_rank(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """
+        Time-series rank of today's value within the past d days.
+        Normalized to (0, 1].
+        """
+        def _rank_last(arr: np.ndarray) -> float:
+            temp = arr.argsort()
+            ranks = np.empty_like(temp, dtype=float)
+            ranks[temp] = np.arange(1, len(arr) + 1)
+            return ranks[-1] / len(arr)
+        return df.rolling(d).apply(_rank_last, raw=True)
+
+    def _scale(self, df: pd.DataFrame, a: float = 1.0) -> pd.DataFrame:
+        """Cross-sectional rescaling so sum(abs(x)) = a."""
+        abs_sum = df.abs().sum(axis=1).replace(0, np.nan)
+        return df.div(abs_sum, axis=0) * a
+
+    def _decay_linear(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Linearly-decaying weighted average over d days (most recent = weight d)."""
+        weights = np.arange(1, d + 1, dtype=float)
+        weights /= weights.sum()
+        return df.rolling(d).apply(lambda x: np.dot(x, weights), raw=True)
+
+    def _sign(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Element-wise sign."""
+        return np.sign(df)
+
+    def _log(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Element-wise natural logarithm."""
+        return np.log(df)
+
+    def _abs(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Element-wise absolute value."""
+        return df.abs()
+
+    def _signed_power(self, df: pd.DataFrame, e: float) -> pd.DataFrame:
+        """sign(x) * |x|^e."""
+        return np.sign(df) * (np.abs(df) ** e)
+
+    def _skew(self, df: pd.DataFrame, d: int) -> pd.DataFrame:
+        """Rolling d-day skewness per stock, using scipy for bias correction."""
+        return df.rolling(d).apply(
+            lambda x: scipy_stats.skew(x[~np.isnan(x)], bias=False) if len(x[~np.isnan(x)]) >= 3 else np.nan,
+            raw=True,
+        )
+
+    def _rolling_ols_resid_std(self, d: int) -> pd.DataFrame:
+        """
+        Vectorized rolling OLS residual std for IVOL.
+
+        For each trading date t, fits:
+            r_stock = alpha + beta * r_market + epsilon
+
+        using the previous d days.  IVOL_t = std(epsilon).
+
+        Vectorized across stocks: for each window, stocks with no NaN in their
+        returns are processed simultaneously via batch matrix multiplication.
+        Stocks with more than d//2 NaN values in the window receive NaN.
+        """
+        mkt = self.market_ret.reindex(self.returns.index).values
+        ret_arr = self.returns.values
+        T, N = ret_arr.shape
+        ivol_arr = np.full((T, N), np.nan)
+
+        for t in range(d - 1, T):
+            w_mkt = mkt[t - d + 1: t + 1]
+            if np.any(np.isnan(w_mkt)):
+                continue
+
+            w_ret = ret_arr[t - d + 1: t + 1, :]
+            X = np.column_stack([np.ones(d), w_mkt])
+
+            try:
+                XtX_inv_Xt = np.linalg.solve(X.T @ X, X.T)
+            except np.linalg.LinAlgError:
+                continue
+
+            valid_stocks = ~np.any(np.isnan(w_ret), axis=0)
+            if not valid_stocks.any():
+                continue
+
+            Y = w_ret[:, valid_stocks]
+            beta = XtX_inv_Xt @ Y
+            resid = Y - X @ beta
+            ivol_arr[t, valid_stocks] = np.std(resid, axis=0, ddof=2)
+
+        return pd.DataFrame(ivol_arr, index=self.returns.index, columns=self.returns.columns)
+
+    def _pit_align_financial(self, col: str) -> pd.DataFrame:
+        """
+        Forward-fill a quarterly financial series to daily frequency using PIT.
+
+        For each trading date t and each stock, the value returned is the most
+        recently announced value with ann_date <= t (merge_asof, backward fill).
+
+        Returns wide DataFrame: index = trade date, columns = stock code.
+        """
+        if self._df_financials.empty or col not in self._df_financials.columns:
+            return pd.DataFrame(
+                np.nan, index=self.close.index, columns=self.close.columns
+            )
+
+        fin = (
+            self._df_financials[["code", "ann_date", col]]
+            .dropna(subset=[col])
+            .sort_values("ann_date")
+        )
+
+        trade_dates = self.close.index
+        codes = self.close.columns
+        result = pd.DataFrame(np.nan, index=trade_dates, columns=codes)
+        # merge_asof requires numeric or datetime key; convert trade dates once
+        dates_df = pd.DataFrame(
+            {"date": pd.to_datetime(trade_dates, format="%Y%m%d", errors="coerce")}
+        ).sort_values("date")
+
+        for code in codes:
+            stock = (
+                fin[fin["code"] == code][["ann_date", col]]
+                .rename(columns={"ann_date": "date"})
+                .assign(date=lambda d: pd.to_datetime(d["date"], format="%Y%m%d", errors="coerce"))
+                .dropna(subset=["date"])
+                .sort_values("date")
+                .groupby("date")
+                .last()
+                .reset_index()
+            )
+            if stock.empty:
+                continue
+            merged = pd.merge_asof(dates_df, stock, on="date", direction="backward")
+            result[code] = merged[col].values
+
+        return result
+
+    def _pit_yoy(self) -> pd.DataFrame:
+        """
+        PIT-aligned year-over-year single-quarter net profit growth.
+
+        Strategy:
+            1. Compute same-quarter (q, year-1) lookback by merging on
+               (code, quarter, year-1).
+            2. yoy = NI_q / NI_{q-4} - 1.
+            3. Align to daily using ann_date.
+        """
+        if self._df_financials.empty or "n_income_single_q" not in self._df_financials.columns:
+            return pd.DataFrame(np.nan, index=self.close.index, columns=self.close.columns)
+
+        fin = self._df_financials[
+            ["code", "ann_date", "end_date", "n_income_single_q"]
+        ].dropna(subset=["n_income_single_q"]).copy()
+
+        fin["end_dt"] = pd.to_datetime(fin["end_date"], format="%Y%m%d", errors="coerce")
+        # Use float so NaT-derived NaN stays as numpy NaN (avoids pd.NA ambiguity in merges).
+        fin["year"]    = fin["end_dt"].dt.year.astype(float)
+        fin["quarter"] = ((fin["end_dt"].dt.month - 1) // 3 + 1).astype(float)
+
+        # For YoY: look up same quarter one year ago per stock
+        fin_prior = fin[["code", "year", "quarter", "n_income_single_q"]].rename(
+            columns={"year": "prior_year", "n_income_single_q": "ni_prior"}
+        )
+        fin_prior["year"] = fin_prior["prior_year"] + 1  # shift by 1 year
+
+        merged = fin.merge(
+            fin_prior[["code", "year", "quarter", "ni_prior"]],
+            on=["code", "year", "quarter"],
+            how="left",
+        )
+        merged["yoy"] = merged["n_income_single_q"] / merged["ni_prior"] - 1
+
+        # PIT align using ann_date
+        yoy_df = merged[["code", "ann_date", "yoy"]].rename(
+            columns={"yoy": "net_profit_yoy"}
+        )
+        # Reuse _pit_align_financial logic with this custom table
+        fin_backup = self._df_financials
+        self._df_financials = yoy_df.rename(columns={"net_profit_yoy": "_tmp_yoy"})
+        result = self._pit_align_financial("_tmp_yoy")
+        self._df_financials = fin_backup
+        result.columns.name = None
+        return result
+
+    # ==================================================================
+    # A — Microstructure and price-volume factors
+    # ==================================================================
+
+    def factor_amihud_illiq(self) -> pd.DataFrame:
+        """
+        Amihud (2002) illiquidity: mean(|R_t| / Amount_t) over 20 days.
+
+        Amount is converted from 千元 to 元 (* 1000) before division.
+        Result is scaled by 1e6 to bring values into a human-readable range
+        (i.e., illiquidity per million yuan of turnover).
+        Higher values → less liquid stock.
+        """
+        if self.amount_raw is None:
+            return pd.DataFrame(np.nan, index=self.close.index, columns=self.close.columns)
+        amount_yuan = self.amount_raw * 1000  # 千元 → 元
+        abs_ret = self.returns.abs()
+        # Avoid division by zero on zero-volume days
+        ratio = abs_ret.div(amount_yuan.replace(0, np.nan))
+        return ratio.rolling(20).mean() * 1e6
+
+    def factor_ivol(self) -> pd.DataFrame:
+        """
+        Idiosyncratic volatility: std of OLS residuals from a 20-day rolling
+        regression of individual returns on CSI 300 returns.
+        """
+        if self.market_ret.empty:
+            return pd.DataFrame(np.nan, index=self.close.index, columns=self.close.columns)
+        return self._rolling_ols_resid_std(d=20)
+
+    def factor_realized_skewness(self) -> pd.DataFrame:
+        """
+        Realized skewness: bias-corrected skewness of daily returns over 20 days.
+        Computed via scipy.stats.skew with bias=False.
+        """
+        return self._skew(self.returns, d=20)
+
+    def factor_vol_price_corr(self) -> pd.DataFrame:
+        """
+        Volume-price rank correlation over 10 days.
+        Computed as Pearson correlation of cross-sectional ranks, which equals
+        Spearman rank correlation.
+        """
+        return self._corr(self._rank(self.close), self._rank(self.vol), d=10)
+
+    # ==================================================================
+    # B — Fundamental and valuation factors
+    # ==================================================================
+
+    def factor_ep(self) -> pd.DataFrame:
+        """Earnings-to-price ratio: 1 / PE.  NaN when PE is 0 or missing."""
+        if self.pe is None:
+            return pd.DataFrame(np.nan, index=self.close.index, columns=self.close.columns)
+        return (1.0 / self.pe.replace(0, np.nan))
+
+    def factor_bp(self) -> pd.DataFrame:
+        """Book-to-price ratio: 1 / PB.  NaN when PB is 0 or missing."""
+        if self.pb is None:
+            return pd.DataFrame(np.nan, index=self.close.index, columns=self.close.columns)
+        return (1.0 / self.pb.replace(0, np.nan))
+
+    def factor_roe(self) -> pd.DataFrame:
+        """
+        ROE (weighted average), PIT-aligned from quarterly fina_indicator.
+        Forward-filled from ann_date; updated only when new reports are announced.
+        """
+        return self._pit_align_financial("roe")
+
+    def factor_ocf_to_revenue(self) -> pd.DataFrame:
+        """
+        Operating cash flow / revenue, PIT-aligned from quarterly fina_indicator.
+        """
+        return self._pit_align_financial("ocf_to_revenue")
+
+    def factor_net_profit_yoy(self) -> pd.DataFrame:
+        """
+        Single-quarter net profit year-over-year growth:
+            yoy = NI_q / NI_{q-4} - 1
+
+        PIT-aligned: only uses data announced on or before each trading date.
+        """
+        return self._pit_yoy()
+
+    # ==================================================================
+    # C — Cross-sectional relative features
+    # ==================================================================
+
+    def factor_industry_rel_turnover(self) -> pd.DataFrame:
+        """
+        Industry-relative turnover rate:
+            turnover_rate − median(turnover_rate in same SW L1 industry)
+
+        Computed cross-sectionally per date.  Industry median uses only
+        stocks with valid turnover data on that date.
+        """
+        if self.turnover_rate is None:
+            return pd.DataFrame(np.nan, index=self.close.index, columns=self.close.columns)
+        return self._industry_demean(self.turnover_rate)
+
+    def factor_industry_rel_bp(self) -> pd.DataFrame:
+        """
+        Industry-relative book-to-price:
+            BP − median(BP in same SW L1 industry)
+        """
+        if self.pb is None:
+            return pd.DataFrame(np.nan, index=self.close.index, columns=self.close.columns)
+        bp = 1.0 / self.pb.replace(0, np.nan)
+        return self._industry_demean(bp)
+
+    def factor_ts_rel_turnover(self) -> pd.DataFrame:
+        """
+        Time-series relative turnover:
+            turnover_rate / rolling_mean(turnover_rate, 60)
+
+        Measures how elevated today's turnover is relative to its own history.
+        """
+        if self.turnover_rate is None:
+            return pd.DataFrame(np.nan, index=self.close.index, columns=self.close.columns)
+        rolling_mean = self.turnover_rate.rolling(60).mean()
+        return self.turnover_rate.div(rolling_mean.replace(0, np.nan))
+
+    def _industry_demean(self, wide: pd.DataFrame) -> pd.DataFrame:
+        """
+        For each date, subtract the SW L1 industry median from each stock's value.
+        Industry membership is static (from stock_info).
+        """
+        # industry_map: Series indexed by code, values = SW L1 industry string
+        industry_map = self._industry.reindex(wide.columns)
+
+        def demean_row(row: pd.Series) -> pd.Series:
+            # groupby industry → transform median → subtract
+            ind_med = row.groupby(industry_map).transform("median")
+            return row - ind_med
+
+        return wide.apply(demean_row, axis=1)
+
+    # ==================================================================
+    # Aggregate
+    # ==================================================================
+
+    def get_all_factors(self) -> pd.DataFrame:
+        """
+        Compute every factor_* method and combine into a long-form DataFrame.
+
+        Returns
+        -------
+        pd.DataFrame
+            Index   : MultiIndex (date, code)
+            Columns : one per factor, named by the factor_* method name
+                      (e.g. 'factor_amihud_illiq', 'factor_ep', ...)
+            Values  : raw factor values; NaN and inf preserved for downstream
+                      cleaning by FactorCleaner.
+        """
+        series: dict = {}
+        for name in sorted(dir(self)):
+            if not name.startswith("factor_"):
+                continue
+            method = getattr(self, name)
+            if not callable(method):
+                continue
+            wide = method()
+            stacked = wide.stack(dropna=False)
+            stacked.name = name
+            series[name] = stacked
+
+        if not series:
+            return pd.DataFrame()
+
+        result = pd.concat(series, axis=1)
+        result.index.names = ["date", "code"]
+        return result

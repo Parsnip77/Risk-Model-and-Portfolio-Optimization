@@ -32,7 +32,7 @@ from net_backtester import NetReturnBacktester
 # -----------------------------------------------------------------------
 DATA_DIR  = ROOT / "data"
 PLOTS_DIR = ROOT / "plots"
-FORWARD_DAYS = 5          # d-day forward return
+FORWARD_DAYS = 1          # d-day forward return
 IC_MEAN_THRESHOLD = 0.015  # minimum |IC mean| to keep a factor
 ICIR_THRESHOLD = 0.20      # minimum |ICIR| to keep a factor
 SHOW_PLOTS = False        # set False to suppress interactive charts
@@ -197,6 +197,7 @@ def main() -> None:
         factor_cols=alpha_cols,
         window=COMBINE_WINDOW,
         orthogonalize=True,
+        forward_days=FORWARD_DAYS,
     )
     _ok(f"Synthetic factor : {synth_df.shape[0]:>7,} rows  "
         f"(dates: {synth_df['trade_date'].nunique()})")

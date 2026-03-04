@@ -1,7 +1,7 @@
 # Local-only docs (never push to remote; project docs for remote will be written later)
 prompt.md
 temporary.md
-Instruction.md
+Instruction_old.md
 
 .cursor/
 

@@ -25,9 +25,10 @@ def calc_forward_return(prices_df: pd.DataFrame, d: int) -> pd.DataFrame:
         Rows for which T+d falls outside the data range contain NaN.
     """
     close_wide = prices_df.pivot(index="trade_date", columns="ts_code", values="close")
+    open_wide = prices_df.pivot(index="trade_date", columns="ts_code", values="open")
 
     # shift(-d) brings future price back to current index position
-    fwd_wide = close_wide.shift(-d) / close_wide - 1
+    fwd_wide = close_wide.shift(-d) / open_wide.shift(-1) - 1
 
     # Stack back to long form, preserving NaN for boundary dates
     fwd_long = (

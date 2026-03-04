@@ -35,7 +35,12 @@
 │   │   ├── factors.py                       # FactorEngine：因子计算（A/B/C 三组）
 │   │   ├── preprocessor.py                  # FactorCleaner：因子清洗
 │   │   └── data_preparation_main.py        # 第一阶段总脚本
-│   ├── LightGBM/                            # 第二阶段（待开发）
+│   ├── LightGBM/                            # 第二阶段
+│   │   ├── __init__.py
+│   │   ├── targets.py                       # calc_forward_return：T+d 前向收益率
+│   │   ├── ml_data_prep.py                  # WalkForwardSplitter：滚动窗口 CV
+│   │   ├── lgbm_model.py                    # AlphaLGBM：LightGBM 训练/预测/SHAP
+│   │   └── ml_analyze_main.py              # 第二阶段总脚本
 │   ├── risk_model/                          # 第三阶段（待开发）
 │   └── portfolio/                           # 第四阶段
 │       ├── __init__.py
@@ -99,7 +104,7 @@ FactorCleaner.process_all()
 | `adj_factor` | (code, date) | 复权因子 |
 | `stock_st` | (code, start_date) | ST/\*ST 状态历史区间 |
 | `index_daily` | date | CSI 300 每日收盘价 |
-| `quarterly_financials` | (code, ann_date, end_date) | 季度财务：ROE、OCF/Rev、单季净利润 |
+| `quarterly_financials` | (code, ann_date, end_date) | 季度财务：ROE |
 
 #### 因子清单
 
@@ -134,15 +139,13 @@ FactorCleaner.process_all()
 | `factor_hl_range` | \(\text{mean}((H-L)/C,\ 10)\) | 日内振幅均值，10 日滚动（流动性 / 波动代理） |
 | `factor_downside_vol` | \(\text{std}(R_t[R_t < 0],\ 20)\) | 下行波动率（仅负收益日），20 日 |
 
-**B 组 — 基本面与估值因子**（季度数据，PIT 对齐，共 5 个）
+**B 组 — 基本面与估值因子**（季度数据，PIT 对齐，共 3 个）
 
 | 因子名 | 公式 | 说明 |
 |--------|------|------|
 | `factor_ep` | \(1/\text{PE}\) | 盈利收益率 |
 | `factor_bp` | \(1/\text{PB}\) | 账面市值比 |
 | `factor_roe` | 加权平均 ROE | 来自 `fina_indicator`，按 ann_date PIT 对齐 |
-| `factor_ocf_to_revenue` | OCF / 营业收入 | 来自 `fina_indicator`，按 ann_date PIT 对齐 |
-| `factor_net_profit_yoy` | \(\text{NI}_q / \text{NI}_{q-4} - 1\) | 单季净利润同比增速，PIT 对齐 |
 
 **C 组 — 截面相对特征**（共 8 个）
 
@@ -165,8 +168,8 @@ FactorCleaner.process_all()
 |------|------|------|
 | `prices.parquet` | (trade_date, ts_code) | 原始 OHLCV + 复权因子 + tradable（bool） |
 | `meta.parquet` | (trade_date, ts_code) | 15 个每日基本面字段 + 申万一级行业 |
-| `factors_raw.parquet` | (trade_date, ts_code) | 39 列原始因子值，保留 NaN |
-| `factors_clean.parquet` | (trade_date, ts_code) | 39 列百分位排名 (0,1]，非可交易格子为 NaN |
+| `factors_raw.parquet` | (trade_date, ts_code) | 37 列原始因子值，保留 NaN |
+| `factors_clean.parquet` | (trade_date, ts_code) | 37 列百分位排名 (0,1]，非可交易格子为 NaN |
 
 #### 重要特殊细节
 
@@ -177,33 +180,78 @@ FactorCleaner.process_all()
 数据库中 `amount` 单位为**千元**，需乘以 1000 转换为元再计算非流动性比率，结果再乘以 10⁶ 以获得可读数量级（每百万元成交量对应的价格冲击）。
 
 **3. PIT（Point-in-Time）财务数据对齐**
-季度财务因子（ROE、OCF/Rev、净利润同比）必须严格遵守公告日期（`ann_date`）对齐原则：对任意交易日 t，只使用满足 `ann_date ≤ t` 的最新数据（`pandas.merge_asof` 实现）。使用报告期（`end_date`）而非公告日会引入未来函数。
+季度财务因子（ROE）必须严格遵守公告日期（`ann_date`）对齐原则：对任意交易日 t，只使用满足 `ann_date ≤ t` 的最新数据（`pandas.merge_asof` 实现）。使用报告期（`end_date`）而非公告日会引入未来函数。`fina_indicator` 同一 `end_date` 可能存在多条记录，数据库存储时保留最晚的 `ann_date`（处理修正报告）。
 
-**4. 累计财务数据转单季**
-Tushare `income` 接口返回**累计值**（Q1=Q1，H1=Q1+Q2，9M=Q1+Q2+Q3，FY=全年）。转换方式：
-- Q1 单季 = Q1 累计
-- Q2 单季 = H1 累计 − Q1 累计
-- Q3 单季 = 9M 累计 − H1 累计
-- Q4 单季 = FY 累计 − 9M 累计
-若同年前一季度数据缺失，则该季度单季值为 NaN（而非错误地使用累计值）。
-
-**5. 财务数据 ann_date 保守处理**
-`fina_indicator` 和 `income` 接口对同一报告期（`end_date`）可能有不同的公告日期。数据库存储时取**两者中较晚的 ann_date**，确保因子值在两张报表均已公开后才被使用。
-
-**6. 可交易性掩码（tradable_mask）**
+**4. 可交易性掩码（tradable_mask）**
 清洗后的因子表中，满足以下任一条件的股票-日期格子被覆写为 NaN：停牌（vol=0）、退市（close 为 NaN 或 0）、涨跌停、ST/\*ST 状态、上市未满 180 天（准新股）。下游模型 `dropna` 时自动排除。
 
-**7. 清洗顺序：先填充再排名**
+**5. 清洗顺序：先填充再排名**
 NaN 填充在百分位排名之前执行，确保每个交易日所有可交易股票都能获得有效排名值，不因财务数据缺失而丢失横截面信息。
 
-**8. IVOL 向量化计算**
+**6. IVOL 向量化计算**
 为提升性能，IVOL 的滚动 OLS 在时间维度上循环（T-d 次），但在股票截面方向**向量化**（一次批量矩阵乘法处理所有 300 只股票），避免双重循环。
 
 ---
 
 ### 第二阶段：LightGBM 机器学习预测
 
-目录：`src/LightGBM/`（待开发）
+目录：`src/LightGBM/`
+
+#### 总体 Pipeline 流程
+
+```
+载入 factors_clean.parquet + prices.parquet + meta.parquet
+   ↓
+calc_forward_return(prices, d=1)  → raw forward_return
+   ↓
+行业中性化：ind_neutral_return = forward_return − groupby(industry, date).mean()
+   （同日同行业仅1只股 → NaN，自动被 dropna 排除）
+   ↓
+合并因子 + ind_neutral_return + forward_return，dropna
+cs_rank_return = pct_rank(ind_neutral_return)  ← 训练 target（双重中性化）
+   ↓
+WalkForwardSplitter(train=18m, val=3m, test=3m, embargo=1d).split()
+   ↓
+各 Fold：
+  AlphaLGBM.train(X, cs_rank_return, early_stopping)
+  → predict(X_test) → 收集预测值
+   ↓
+拼接所有 fold 预测 → 3 日滚动均值平滑 ml_alpha（min_periods=3）
+   ↓
+IC(ml_alpha, raw forward_return)  → IC 均值/标准差/ICIR + 图（ml_alpha_ic.png）
+   ↓
+LayeredBacktester(ml_alpha, forward_return)  → 分层净值图（ml_alpha_layered.png）
+NetReturnBacktester(ml_alpha, prices)        → 净收益图（ml_alpha_net.png）
+   ↓
+各 fold 平均特征重要度 → 柱状图（feature_importance.png）
+SHAP beeswarm（最后一折，top-10 特征，n=300 采样）→ shap_beeswarm.png
+   ↓
+输出文字报告 result_ml.txt
+```
+
+#### 文件说明
+
+| 文件 | 类 / 函数 | 说明 |
+|------|-----------|------|
+| `src/LightGBM/targets.py` | `calc_forward_return` | 计算 T+d 日前向收益率（宽表 → 长表） |
+| `src/LightGBM/ml_data_prep.py` | `WalkForwardSplitter` | 滚动窗口 CV 分割器，防止时序泄漏 |
+| `src/LightGBM/lgbm_model.py` | `AlphaLGBM` | LightGBM 回归器封装（early stopping + SHAP） |
+| `src/LightGBM/ml_analyze_main.py` | `main()` | 第二阶段端到端执行脚本 |
+
+#### 关键设计决策
+
+**1. 训练 target vs 评估 target 分离**
+- **训练**：`cs_rank_return = pct_rank(ind_neutral_return)`，去除市场 beta + 行业 beta，模型学习纯股票选择信号。
+- **IC 评估 & 回测 P&L**：使用原始 `forward_return`，反映实际可获得的绝对收益，结果更真实可比。
+
+**2. 行业中性化逻辑**
+同日同行业内，至少需要 2 只可交易股票才能计算有意义的行业均值。仅 1 只的行业赋予 NaN，由下游 `dropna` 自动排除，不做特殊处理。
+
+**3. embargo_days = 1**
+`FORWARD_DAYS=1`，因此 embargo 最小设置为 1（防止 val 集最后一行的 target 与 test 集首行的 feature 重叠）。
+
+**4. 3 日滚动均值平滑**
+预测值在股票维度滚动平均，降低日间信号噪声与组合换手率。`min_periods=3` 确保每只股票前两个预测日自动为 NaN 并被排除。
 
 ---
 
@@ -247,6 +295,9 @@ EOF
 
 # 4. 运行第一阶段总脚本（因子计算 + 清洗 + 导出 Parquet）
 python src/data_preparation/data_preparation_main.py
+
+# 5. 运行第二阶段总脚本（LightGBM 训练 + IC + 回测 + SHAP）
+python src/LightGBM/ml_analyze_main.py
 ```
 
 ---

@@ -10,11 +10,9 @@ A — Microstructure and price-volume factors (use adjusted prices):
     vol_price_corr    : rolling 10-day Spearman rank correlation between price and volume
 
 B — Fundamental and valuation factors (point-in-time quarterly data):
-    ep                : earnings-to-price  (1 / PE)
-    bp                : book-to-price      (1 / PB)
-    roe               : return on equity, quarterly, PIT-aligned via ann_date
-    ocf_to_revenue    : operating cash flow / revenue, quarterly, PIT-aligned
-    net_profit_yoy    : single-quarter net profit year-over-year growth, PIT-aligned
+    ep  : earnings-to-price  (1 / PE)
+    bp  : book-to-price      (1 / PB)
+    roe : return on equity, quarterly, PIT-aligned via ann_date
 
 C — Cross-sectional relative features:
     industry_rel_turnover : turnover_rate − industry cross-section median
@@ -325,53 +323,6 @@ class FactorEngine:
 
         return result
 
-    def _pit_yoy(self) -> pd.DataFrame:
-        """
-        PIT-aligned year-over-year single-quarter net profit growth.
-
-        Strategy:
-            1. Compute same-quarter (q, year-1) lookback by merging on
-               (code, quarter, year-1).
-            2. yoy = NI_q / NI_{q-4} - 1.
-            3. Align to daily using ann_date.
-        """
-        if self._df_financials.empty or "n_income_single_q" not in self._df_financials.columns:
-            return pd.DataFrame(np.nan, index=self.close.index, columns=self.close.columns)
-
-        fin = self._df_financials[
-            ["code", "ann_date", "end_date", "n_income_single_q"]
-        ].dropna(subset=["n_income_single_q"]).copy()
-
-        fin["end_dt"] = pd.to_datetime(fin["end_date"], format="%Y%m%d", errors="coerce")
-        # Use float so NaT-derived NaN stays as numpy NaN (avoids pd.NA ambiguity in merges).
-        fin["year"]    = fin["end_dt"].dt.year.astype(float)
-        fin["quarter"] = ((fin["end_dt"].dt.month - 1) // 3 + 1).astype(float)
-
-        # For YoY: look up same quarter one year ago per stock
-        fin_prior = fin[["code", "year", "quarter", "n_income_single_q"]].rename(
-            columns={"year": "prior_year", "n_income_single_q": "ni_prior"}
-        )
-        fin_prior["year"] = fin_prior["prior_year"] + 1  # shift by 1 year
-
-        merged = fin.merge(
-            fin_prior[["code", "year", "quarter", "ni_prior"]],
-            on=["code", "year", "quarter"],
-            how="left",
-        )
-        merged["yoy"] = merged["n_income_single_q"] / merged["ni_prior"] - 1
-
-        # PIT align using ann_date
-        yoy_df = merged[["code", "ann_date", "yoy"]].rename(
-            columns={"yoy": "net_profit_yoy"}
-        )
-        # Reuse _pit_align_financial logic with this custom table
-        fin_backup = self._df_financials
-        self._df_financials = yoy_df.rename(columns={"net_profit_yoy": "_tmp_yoy"})
-        result = self._pit_align_financial("_tmp_yoy")
-        self._df_financials = fin_backup
-        result.columns.name = None
-        return result
-
     # ==================================================================
     # A — Microstructure and price-volume factors
     # ==================================================================
@@ -586,21 +537,6 @@ class FactorEngine:
         Forward-filled from ann_date; updated only when new reports are announced.
         """
         return self._pit_align_financial("roe")
-
-    def factor_ocf_to_revenue(self) -> pd.DataFrame:
-        """
-        Operating cash flow / revenue, PIT-aligned from quarterly fina_indicator.
-        """
-        return self._pit_align_financial("ocf_to_revenue")
-
-    def factor_net_profit_yoy(self) -> pd.DataFrame:
-        """
-        Single-quarter net profit year-over-year growth:
-            yoy = NI_q / NI_{q-4} - 1
-
-        PIT-aligned: only uses data announced on or before each trading date.
-        """
-        return self._pit_yoy()
 
     # ==================================================================
     # C — Cross-sectional relative features

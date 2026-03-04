@@ -32,72 +32,17 @@ import config
 # Module-level helper for single-quarter net income conversion
 # ---------------------------------------------------------------------------
 
-def _to_single_quarter(df: pd.DataFrame, ni_col: str = "n_income_cumulative") -> pd.Series:
-    """
-    Convert cumulative quarterly net income to single-quarter values.
-
-    Tushare income API returns cumulative values within each fiscal year:
-        Q1  = Q1
-        H1  = Q1 + Q2   (reported at Q2)
-        9M  = Q1+Q2+Q3  (reported at Q3)
-        FY  = Q1+Q2+Q3+Q4 (reported at Q4 / annual)
-
-    Strategy:
-        - Sort by (code, end_date), derive fiscal year and quarter from end_date.
-        - Within each (code, fiscal_year) group, compute shifted cumulative and subtract.
-        - Q1 is always taken as-is (no prior quarter within the year).
-        - If the prior quarter is missing, the result is NaN (safer than using 0).
-
-    Parameters
-    ----------
-    df : DataFrame
-        Must contain columns: [end_date, ni_col].
-        end_date format: YYYYMMDD string.
-    ni_col : str
-        Column name for cumulative net income.
-
-    Returns
-    -------
-    pd.Series
-        Single-quarter net income aligned to df's index.
-    """
-    if df.empty:
-        return pd.Series(dtype=float, index=df.index)
-
-    tmp = df[[ni_col, "end_date"]].copy()
-    tmp["end_dt"] = pd.to_datetime(tmp["end_date"], format="%Y%m%d", errors="coerce")
-    # Use float (not Int64) so that NaT-derived NaN stays as numpy NaN.
-    # Int64 would produce pd.NA, which raises "boolean value of NA is ambiguous"
-    # inside np.where comparisons below.
-    tmp["year"]    = tmp["end_dt"].dt.year.astype(float)
-    tmp["quarter"] = ((tmp["end_dt"].dt.month - 1) // 3 + 1).astype(float)
-
-    tmp["prev_q"] = tmp.groupby(["year"])["quarter"].shift(1)
-    tmp["prev_cum"] = tmp.groupby(["year"])[ni_col].shift(1)
-
-    # Valid subtraction: previous quarter must be exactly one quarter before current
-    valid = (tmp["quarter"] - tmp["prev_q"]) == 1
-    single_q = np.where(
-        tmp["quarter"] == 1,
-        tmp[ni_col],
-        np.where(valid, tmp[ni_col] - tmp["prev_cum"], np.nan),
-    )
-    return pd.Series(single_q, index=df.index, dtype=float)
-
-
 class DataEngine:
     """
     Central data I/O class for the risk model project.
 
     New tables compared to original:
         index_daily          : CSI 300 index daily close
-        quarterly_financials : (code, ann_date, end_date) × [roe, ocf_to_revenue, n_income_single_q]
+        quarterly_financials : (code, ann_date, end_date) × [roe]
 
     Point-in-time (PIT) principle for quarterly_financials:
         ann_date is the public announcement date.  The FactorEngine performs
         merge_asof(ann_date <= trade_date) to ensure no look-ahead bias.
-        When fina_indicator and income have different ann_dates for the same
-        end_date, the LATER of the two is stored (more conservative).
     """
 
     def __init__(self):
@@ -169,12 +114,10 @@ class DataEngine:
             );
 
             CREATE TABLE IF NOT EXISTS quarterly_financials (
-                code              TEXT  NOT NULL,
-                ann_date          TEXT  NOT NULL,
-                end_date          TEXT  NOT NULL,
-                roe               REAL,
-                ocf_to_revenue    REAL,
-                n_income_single_q REAL,
+                code     TEXT  NOT NULL,
+                ann_date TEXT  NOT NULL,
+                end_date TEXT  NOT NULL,
+                roe      REAL,
                 PRIMARY KEY (code, ann_date, end_date)
             );
             """
@@ -266,7 +209,7 @@ class DataEngine:
             3. Adjustment factors per stock
             4. ST status history per stock
             5. CSI 300 index daily close  (NEW)
-            6. Quarterly financials per stock: roe, ocf_to_revenue, NI  (NEW)
+            6. Quarterly financials per stock: roe  (NEW)
         """
         codes = self._get_constituents()
         print(f"Universe: {len(codes)} stocks  [{config.UNIVERSE_INDEX}]")
@@ -459,14 +402,12 @@ class DataEngine:
         self, codes: List[str], conn: sqlite3.Connection
     ) -> None:
         """
-        Download per-stock quarterly financials and persist to quarterly_financials.
+        Download per-stock quarterly ROE from fina_indicator and persist to
+        quarterly_financials.
 
-        For each stock, makes two API calls:
-            1. fina_indicator  → roe_avg, ocf_to_revenue
-            2. income          → n_income_attr_p (归属于母公司净利润, cumulative)
-
-        Both are merged on end_date; the later ann_date of the two is used (conservative PIT).
-        Cumulative n_income is converted to single-quarter values before storage.
+        One API call per stock (fina_indicator → roe_avg).
+        The latest ann_date per end_date is retained (handles amended reports).
+        Only quarter-end dates (month in {3, 6, 9, 12}) are stored.
         """
         fin_cached: set = set(
             pd.read_sql("SELECT DISTINCT code FROM quarterly_financials", conn)[
@@ -475,121 +416,49 @@ class DataEngine:
         )
         skipped = 0
         n = len(codes)
-        print("Downloading quarterly financials (roe, ocf_to_revenue, net income)...")
+        print("Downloading quarterly financials (roe)...")
 
         for i, ts_code in enumerate(codes):
             if ts_code in fin_cached:
                 skipped += 1
                 continue
             try:
-                # --- fina_indicator ---
                 time.sleep(config.SLEEP_PER_CALL)
                 fi = self.pro.fina_indicator(
                     ts_code=ts_code,
                     start_date=config.START_DATE,
                     end_date=config.END_DATE,
-                    fields="ts_code,ann_date,end_date,roe_avg,ocf_to_revenue",
+                    fields="ts_code,ann_date,end_date,roe_avg",
                 )
 
-                # --- income statement ---
-                time.sleep(config.SLEEP_PER_CALL)
-                inc = self.pro.income(
-                    ts_code=ts_code,
-                    start_date=config.START_DATE,
-                    end_date=config.END_DATE,
-                    fields="ts_code,ann_date,end_date,n_income_attr_p",
-                )
-
-                # Sentinel row so stock is marked as cached even if both fail
-                has_data = False
-
-                if fi is not None and not fi.empty:
-                    fi = fi.rename(columns={"ts_code": "code", "roe_avg": "roe"})
-                    # Tushare may omit fields silently; add missing columns as NaN
-                    for _col in ["roe", "ocf_to_revenue"]:
-                        if _col not in fi.columns:
-                            fi[_col] = np.nan
-                    # Keep latest ann_date per end_date
-                    fi = (
-                        fi.sort_values("ann_date")
-                        .groupby("end_date")
-                        .last()
-                        .reset_index()
-                    )
-                    has_data = True
-                else:
-                    fi = pd.DataFrame(columns=["code", "ann_date", "end_date", "roe", "ocf_to_revenue"])
-
-                if inc is not None and not inc.empty:
-                    inc = inc.rename(columns={"ts_code": "code"})
-                    if "n_income_attr_p" not in inc.columns:
-                        inc["n_income_attr_p"] = np.nan
-                    inc = (
-                        inc.sort_values("ann_date")
-                        .groupby("end_date")
-                        .last()
-                        .reset_index()
-                    )
-                    has_data = True
-                else:
-                    inc = pd.DataFrame(columns=["code", "ann_date", "end_date", "n_income_attr_p"])
-
-                if not has_data:
-                    # No data at all — insert sentinel to mark as cached
+                if fi is None or fi.empty:
                     pd.DataFrame([{
-                        "code": ts_code, "ann_date": "99991231", "end_date": "99991231",
-                        "roe": None, "ocf_to_revenue": None, "n_income_single_q": None,
+                        "code": ts_code, "ann_date": "99991231",
+                        "end_date": "99991231", "roe": None,
                     }]).to_sql("quarterly_financials", conn, if_exists="append", index=False)
                     continue
 
-                # Merge on end_date; outer join so we get rows from either source
-                merged = fi.merge(
-                    inc[["end_date", "ann_date", "n_income_attr_p"]],
-                    on="end_date",
-                    how="outer",
-                    suffixes=("_fi", "_inc"),
-                )
-                # code might be NaN on rows that only came from inc
-                if "code_fi" in merged.columns:
-                    merged["code"] = merged["code_fi"].fillna(ts_code)
-                    merged = merged.drop(columns=["code_fi"], errors="ignore")
-                merged["code"] = merged.get("code", ts_code).fillna(ts_code)
+                fi = fi.rename(columns={"ts_code": "code", "roe_avg": "roe"})
+                if "roe" not in fi.columns:
+                    fi["roe"] = np.nan
 
-                # Use later ann_date (more conservative PIT).
-                # ann_date columns are YYYYMMDD strings; outer-join NaN values are float.
-                # Convert both to datetime before taking max to avoid cross-type comparison.
-                ann_fi  = pd.to_datetime(
-                    merged.get("ann_date_fi",  pd.Series([pd.NaT] * len(merged))),
-                    format="%Y%m%d", errors="coerce",
-                )
-                ann_inc = pd.to_datetime(
-                    merged.get("ann_date_inc", pd.Series([pd.NaT] * len(merged))),
-                    format="%Y%m%d", errors="coerce",
-                )
-                merged["ann_date"] = (
-                    pd.DataFrame({"fi": ann_fi, "inc": ann_inc})
-                    .max(axis=1)
-                    .dt.strftime("%Y%m%d")
-                )
-                merged = merged.drop(
-                    columns=["ann_date_fi", "ann_date_inc"], errors="ignore"
-                )
-
-                # Filter to quarters only (end_date month in {03,06,09,12})
-                merged["_month"] = pd.to_datetime(
-                    merged["end_date"], format="%Y%m%d", errors="coerce"
+                # Filter to quarter-end dates only
+                fi["_month"] = pd.to_datetime(
+                    fi["end_date"], format="%Y%m%d", errors="coerce"
                 ).dt.month
-                merged = merged[merged["_month"].isin([3, 6, 9, 12])].drop(columns=["_month"])
+                fi = fi[fi["_month"].isin([3, 6, 9, 12])].drop(columns=["_month"])
 
-                # Compute single-quarter net income
-                merged = merged.sort_values("end_date").reset_index(drop=True)
-                merged["n_income_single_q"] = _to_single_quarter(
-                    merged, ni_col="n_income_attr_p"
+                # Keep latest ann_date per end_date (handles restatements)
+                fi = (
+                    fi.sort_values("ann_date")
+                    .groupby("end_date")
+                    .last()
+                    .reset_index()
                 )
 
-                out = merged[
-                    ["code", "ann_date", "end_date", "roe", "ocf_to_revenue", "n_income_single_q"]
-                ].dropna(subset=["ann_date", "end_date"])
+                out = fi[["code", "ann_date", "end_date", "roe"]].dropna(
+                    subset=["ann_date", "end_date"]
+                )
                 out["code"] = ts_code
 
                 if not out.empty:
@@ -647,8 +516,8 @@ class DataEngine:
             df_adj         : MultiIndex (date, code), col [adj_factor]
             df_st          : flat [code, start_date, end_date]
             df_index       : Series, index=date (str), values=close (CSI 300)
-            df_financials  : flat [code, ann_date, end_date, roe, ocf_to_revenue,
-                                   n_income_single_q]  (sorted by code, ann_date)
+            df_financials  : flat [code, ann_date, end_date, roe]
+                             (sorted by code, ann_date)
         """
         conn = sqlite3.connect(self.db_path)
 

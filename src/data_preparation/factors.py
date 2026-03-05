@@ -80,6 +80,18 @@ class FactorEngine:
         close_raw = df_price["close"].unstack("code")
         self.vol  = df_price["vol"].unstack("code")     # never adjusted
 
+        # ---- Precise VWAP: amount (thousand CNY) × 10 / vol (lots) ----
+        # amount (千元) × 1000 / (vol (手) × 100) = amount × 10 / vol  (元/股)
+        if "amount" in df_price.columns:
+            amount_wide = df_price["amount"].unstack("code")
+            vwap_raw = (amount_wide * 10).div(self.vol)
+            # Fallback to typical price where amount or vol is missing / zero
+            fallback = (high_raw + low_raw + close_raw) / 3
+            valid = amount_wide.notna() & (self.vol > 0)
+            vwap_raw = vwap_raw.where(valid, fallback)
+        else:
+            vwap_raw = (high_raw + low_raw + close_raw) / 3
+
         # Raw amount (千元 → 元 conversion applied inside amihud_illiq)
         if "amount" in df_price.columns:
             self.amount_raw = df_price["amount"].unstack("code")  # unit: 千元
@@ -98,11 +110,13 @@ class FactorEngine:
             self.high  = high_raw.mul(adj_ratio)
             self.low   = low_raw.mul(adj_ratio)
             self.close = close_raw.mul(adj_ratio)
+            self.vwap = vwap_raw.mul(adj_ratio)
         else:
             self.open  = open_raw
             self.high  = high_raw
             self.low   = low_raw
             self.close = close_raw
+            self.vwap = vwap_raw
 
         self.returns  = self.close.pct_change()
         self.total_mv = df_mv["total_mv"].unstack("code")
@@ -651,6 +665,234 @@ class FactorEngine:
 
         return wide.apply(demean_row, axis=1)
 
+    # ------
+
+    def factor_5_day_reversal(self) -> pd.DataFrame:
+        """
+        factor_5_day_reversal: (close - delay(close,5)) / delay(close,5)
+
+        Reversal of the last 5 days' closing prices.
+        """
+        return (self.close - self._delay(self.close, 5)) / self._delay(self.close, 5)   
+
+    def alpha001(self) -> pd.DataFrame:
+        """
+        Alpha#1: (rank(Ts_ArgMax(SignedPower(((returns < 0) ? stddev(returns, 20) : close), 2.), 5)) - 0.5)
+
+        For each stock: if today's return is negative, substitute stddev(returns, 20) for
+        close; otherwise keep close. Apply SignedPower(x, 2) to the result, then find
+        which of the past 5 days had the maximum value (Ts_ArgMax). Cross-sectionally
+        rank that position index and subtract 0.5 to centre around zero.
+        """
+        std20 = self._stddev(self.returns, 20)
+        inner = np.where(self.returns < 0, std20, self.close)
+        inner = pd.DataFrame(inner, index=self.close.index, columns=self.close.columns)
+        sp = self._signed_power(inner, 2.0)
+        return self._rank(self._ts_argmax(sp, 5)) - 0.5
+
+    def alpha003(self) -> pd.DataFrame:
+        """
+        Alpha#3: (-1 * correlation(rank(open), rank(volume), 10))
+
+        Negative rolling correlation between cross-sectional ranks of open price and
+        volume over a 10-day window. Penalises stocks whose open rank and volume rank
+        move together (momentum-and-volume agreement is faded).
+        """
+        return -1 * self._corr(self._rank(self.open), self._rank(self.vol), 10)
+
+    def alpha006(self) -> pd.DataFrame:
+        """
+        Alpha#6: (-1 * correlation(open, volume, 10))
+
+        Negative time-series correlation between open price and volume
+        over a 10-day rolling window, per stock.
+        High (positive) correlation is penalized → contrarian tilt.
+        """
+        return -1 * self._corr(self.open, self.vol, 10)
+
+    def alpha012(self) -> pd.DataFrame:
+        """
+        Alpha#12: (sign(delta(volume, 1)) * (-1 * delta(close, 1)))
+
+        When volume increases (sign = +1), take a short position in the
+        close move (mean-reversion). When volume falls, follow the close move.
+        Combines volume direction with intraday price change.
+        """
+        return self._sign(self._delta(self.vol, 1)) * (-1 * self._delta(self.close, 1))
+
+    def alpha038(self) -> pd.DataFrame:
+        """
+        Alpha#38: ((-1 * rank(Ts_Rank(close, 10))) * rank((close / open)))
+
+        Stocks that are near their recent highs (high ts_rank) AND have a
+        high close-to-open ratio are shorted (both ranks are high → product large → -1 applied).
+        """
+        ts_rnk = self._ts_rank(self.close, 10)
+        return (-1 * self._rank(ts_rnk)) * self._rank(self.close / self.open)
+
+    def alpha040(self) -> pd.DataFrame:
+        """
+        Alpha#40: ((-1 * rank(stddev(high, 10))) * correlation(high, volume, 10))
+
+        Stocks with high volatility in the high price (large stddev rank) are shorted
+        when high price and volume are positively correlated over the past 10 days.
+        Combines dispersion penalty with momentum-volume agreement.
+        """
+        return (-1 * self._rank(self._stddev(self.high, 10))) * self._corr(self.high, self.vol, 10)
+
+    def alpha041(self) -> pd.DataFrame:
+        """
+        Alpha#41: (((high * low)^0.5) - vwap)
+
+        Geometric mean of the day's high and low minus vwap.
+        Positive when the geometric mean exceeds the typical price;
+        may signal upward intraday momentum.
+        Uses precise vwap = amount * 10 / vol when available.
+        """
+        return np.power(self.high * self.low, 0.5) - self.vwap
+
+    def alpha042(self) -> pd.DataFrame:
+        """
+        Alpha#42: (rank((vwap - close)) / rank((vwap + close)))
+
+        Ratio of the cross-sectional rank of (vwap - close) to the rank of (vwap + close).
+        Positive when close < vwap (stock slid below the day's average price); acts as a
+        delay-0 mean-reversion signal — stocks that underperformed their vwap are favoured.
+        """
+        return self._rank(self.vwap - self.close) / self._rank(self.vwap + self.close)
+
+    def alpha054(self) -> pd.DataFrame:
+        """
+        Alpha#54: ((-1 * ((low - close) * (open^5))) / ((low - high) * (close^5)))
+
+        ^ denotes signedpower: sign(x)*|x|^e. For positive prices this reduces to
+        the ordinary power. Denominator (low - high) <= 0; division by zero yields
+        NaN naturally and is left for downstream cleaning.
+        """
+        num = -1 * (self.low - self.close) * self._signed_power(self.open, 5)
+        den = (self.low - self.high) * self._signed_power(self.close, 5)
+        return num / den
+
+    def alpha072(self) -> pd.DataFrame:
+        """
+        Alpha#72: (rank(decay_linear(correlation((high+low)/2, adv40, 8.93345), 10.1519)) /
+                   rank(decay_linear(correlation(Ts_Rank(vwap,3.72469),
+                                                 Ts_Rank(volume,18.5188), 6.86671), 2.95011)))
+
+        Non-integer window parameters are floored per the paper convention:
+          correlation window 8.93345 → 8, decay_linear 10.1519 → 10
+          Ts_Rank vwap 3.72469 → 3, Ts_Rank vol 18.5188 → 18
+          correlation window 6.86671 → 6, decay_linear 2.95011 → 2
+        adv40 approximated as 40-day rolling mean of share volume.
+        """
+        adv40 = self.vol.rolling(40).mean()
+        mid = (self.high + self.low) / 2
+        num = self._rank(self._decay_linear(self._corr(mid, adv40, 8), 10))
+        ts_rank_vwap = self._ts_rank(self.vwap, 3)
+        ts_rank_vol = self._ts_rank(self.vol, 18)
+        den = self._rank(self._decay_linear(self._corr(ts_rank_vwap, ts_rank_vol, 6), 2))
+        return num / den
+
+    def alpha088(self) -> pd.DataFrame:
+        """
+        Alpha#88: min(rank(decay_linear(((rank(open)+rank(low))-(rank(high)+rank(close))), 8.06882)),
+                      Ts_Rank(decay_linear(correlation(Ts_Rank(close,8.44728),
+                                                       Ts_Rank(adv60,20.6966),8.01266),6.65053),2.61957))
+
+        Element-wise minimum of two signals:
+          (1) rank of decay-linear-smoothed difference between open/low ranks and high/close ranks
+          (2) ts_rank of decay-linear-smoothed rolling correlation between time-series ranks of
+              close and adv60
+        Non-integer window parameters are floored per paper convention:
+          decay_linear 8.06882→8, Ts_Rank close 8.44728→8, Ts_Rank adv60 20.6966→20,
+          corr 8.01266→8, decay_linear 6.65053→6, outer Ts_Rank 2.61957→2
+        adv60 approximated as 60-day rolling mean of share volume.
+        """
+        adv60 = self.vol.rolling(60).mean()
+        signal1 = self._rank(
+            self._decay_linear(
+                (self._rank(self.open) + self._rank(self.low))
+                - (self._rank(self.high) + self._rank(self.close)),
+                8,
+            )
+        )
+        signal2 = self._ts_rank(
+            self._decay_linear(
+                self._corr(self._ts_rank(self.close, 8), self._ts_rank(adv60, 20), 8),
+                6,
+            ),
+            2,
+        )
+        return np.minimum(signal1, signal2)
+
+    def alpha094(self) -> pd.DataFrame:
+        """
+        Alpha#94: ((rank(vwap - ts_min(vwap, 11.5783)) ^
+                    Ts_Rank(correlation(Ts_Rank(vwap,19.6462),
+                                        Ts_Rank(adv60,4.02992), 18.0926), 2.70756)) * -1)
+
+        ^ denotes signedpower(base, exp).
+        Non-integer window parameters are floored per the paper convention:
+          ts_min 11.5783 → 11, Ts_Rank vwap 19.6462 → 19
+          Ts_Rank adv60 4.02992 → 4, correlation 18.0926 → 18, outer Ts_Rank 2.70756 → 2
+        adv60 approximated as 60-day rolling mean of share volume.
+        """
+        adv60 = self.vol.rolling(60).mean()
+        ts_rank_vwap = self._ts_rank(self.vwap, 19)
+        ts_rank_adv60 = self._ts_rank(adv60, 4)
+        base = self._rank(self.vwap - self._ts_min(self.vwap, 11))
+        exp = self._ts_rank(self._corr(ts_rank_vwap, ts_rank_adv60, 18), 2)
+        return self._signed_power(base, exp) * -1
+
+    def alpha098(self) -> pd.DataFrame:
+        """
+        Alpha#98: (rank(decay_linear(correlation(vwap, sum(adv5,26.4719), 4.58418), 7.18088)) -
+                   rank(decay_linear(Ts_Rank(Ts_ArgMin(correlation(rank(open),
+                                                                    rank(adv15),20.8187),8.62571),
+                                             6.95668), 8.07206)))
+
+        Difference of two ranked decay-linear signals:
+          (1) rank of decay-smooth correlation between vwap and 26-day sum of adv5
+          (2) rank of decay-smooth ts_rank of ts_argmin of correlation between
+              open-rank and adv15-rank
+        Non-integer window parameters are floored per paper convention:
+          sum adv5 26.4719→26, corr 4.58418→4, decay_linear 7.18088→7,
+          corr(open,adv15) 20.8187→20, Ts_ArgMin 8.62571→8, Ts_Rank 6.95668→6,
+          decay_linear 8.07206→8
+        adv5/adv15 approximated as 5/15-day rolling mean of share volume.
+        """
+        adv5  = self.vol.rolling(5).mean()
+        adv15 = self.vol.rolling(15).mean()
+        signal1 = self._rank(
+            self._decay_linear(
+                self._corr(self.vwap, self._sum(adv5, 26), 4),
+                7,
+            )
+        )
+        signal2 = self._rank(
+            self._decay_linear(
+                self._ts_rank(
+                    self._ts_argmin(
+                        self._corr(self._rank(self.open), self._rank(adv15), 20),
+                        8,
+                    ),
+                    6,
+                ),
+                8,
+            )
+        )
+        return signal1 - signal2
+
+    def alpha101(self) -> pd.DataFrame:
+        """
+        Alpha#101: ((close - open) / ((high - low) + .001))
+
+        Intraday momentum: how much the stock closed relative to where it opened,
+        normalized by the day's price range. The +0.001 avoids division by zero
+        on days with no price movement.
+        """
+        return (self.close - self.open) / (self.high - self.low + 0.001)
+
     # ==================================================================
     # Aggregate
     # ==================================================================
@@ -670,7 +912,7 @@ class FactorEngine:
         """
         series: dict = {}
         for name in sorted(dir(self)):
-            if not name.startswith("factor_"):
+            if not (name.startswith("factor_") or name.startswith("alpha")):
                 continue
             method = getattr(self, name)
             if not callable(method):

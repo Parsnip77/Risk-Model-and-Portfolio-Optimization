@@ -8,13 +8,32 @@ using an overlapping portfolio construction to smooth turnover across the
 holding period d:
 
     Overlapping weight at T:
-        daily_w_T[s]  = 1/|top20%_T|  if stock s is in top 20% on day T
+        daily_w_T[s]  = weight of stock s selected on day T
         overlap_w_T   = mean(daily_w_T, daily_w_{T-1}, ..., daily_w_{T-d+1})
 
     Return accounting:
         GrossRet_T    = sum_s( overlap_w_{T-1,s} * R_{T,s} )
         Turnover_T    = 0.5 * ||overlap_w_T - overlap_w_{T-1}||_1
         NetRet_T      = GrossRet_T - Turnover_T * cost_rate
+
+Two stock-selection modes
+--------------------------
+Standard mode (industry_df=None)
+    Full cross-section: select the global top ``top_pct`` fraction of stocks
+    by their alpha score each day.  All selected stocks receive equal weight.
+
+Industry-neutral mode (industry_df provided)
+    Step 1 — Intra-industry selection:
+        Within each (trade_date, industry), select the top ``top_pct`` fraction
+        of stocks by their alpha score.  Industries with fewer than 2 stocks
+        receive no selection (their stocks are excluded that day).
+    Step 2 — Industry-equal-weight construction:
+        Each selected stock receives weight:
+            w_s = 1 / (N_ind_with_top × N_top_in_industry_of_s)
+        where N_ind_with_top is the number of industries that contributed at
+        least one stock to the portfolio on that date.  This ensures every
+        industry contributes equally to the portfolio regardless of its size,
+        symmetric with the industry-neutralised training target (Plan B).
 
 Performance metrics
 -------------------
@@ -23,8 +42,10 @@ Maximum Drawdown, Average Daily Turnover, Breakeven Turnover.
 
 Public API
 ----------
-    nb = NetReturnBacktester(alpha_df, prices_df, forward_days=5,
-                             cost_rate=0.002, rf=0.03, plots_dir=None)
+    nb = NetReturnBacktester(alpha_df, prices_df,
+                             industry_df=None,   # optional
+                             forward_days=1, cost_rate=0.002,
+                             rf=0.03, plots_dir=None, top_pct=0.20)
     summary = nb.run_backtest()   # pd.Series of performance metrics
     fig     = nb.plot(show=False) # cumulative NAV chart, saved to plots_dir
 """
@@ -52,16 +73,24 @@ class NetReturnBacktester:
         Exactly one column other than trade_date / ts_code is expected.
     prices_df : pd.DataFrame
         Flat DataFrame with at least columns [trade_date, ts_code, close].
+    industry_df : pd.DataFrame, optional
+        Flat DataFrame with columns [trade_date, ts_code, <industry_col>].
+        Exactly one column other than trade_date / ts_code is expected.
+        When provided, enables industry-neutral stock selection (Plan B):
+        stocks are selected within each industry and weights are constructed
+        so that every industry contributes equally to the portfolio.
+        When None (default), standard full-cross-section top selection is used.
     forward_days : int
         Rebalancing cycle length (= number of overlapping buckets).
     cost_rate : float
-        Round-trip transaction cost rate (default 0.002 = 2 bps).
+        Round-trip transaction cost rate (default 0.0035 = 35 bps).
     rf : float
         Annual risk-free rate for Sharpe and breakeven calculations (default 0.03).
     plots_dir : path-like, optional
         Directory where the chart is saved.  If None, no file is written.
     top_pct : float
-        Fraction of top-ranked stocks to hold long (default 0.2 = top 20%).
+        Fraction of top-ranked stocks to hold long per (industry in neutral
+        mode, or globally in standard mode).  Default 0.2 = top 20%.
     """
 
     TRADING_DAYS_PER_YEAR: int = 252
@@ -70,6 +99,7 @@ class NetReturnBacktester:
         self,
         alpha_df: pd.DataFrame,
         prices_df: pd.DataFrame,
+        industry_df: Optional[pd.DataFrame] = None,
         forward_days: int = 1,
         cost_rate: float = 0.0035,
         rf: float = 0.03,
@@ -90,6 +120,20 @@ class NetReturnBacktester:
         self.top_pct = top_pct
         self.plots_dir = pathlib.Path(plots_dir) if plots_dir is not None else None
 
+        # Industry metadata (optional)
+        self._industry_col: Optional[str] = None
+        self._industry_df: Optional[pd.DataFrame] = None
+        if industry_df is not None:
+            ind_extra = [c for c in industry_df.columns if c not in key_cols]
+            if len(ind_extra) != 1:
+                raise ValueError(
+                    f"industry_df must have exactly one non-key column; got {ind_extra}"
+                )
+            self._industry_col = ind_extra[0]
+            self._industry_df = industry_df[
+                ["trade_date", "ts_code", self._industry_col]
+            ].drop_duplicates()
+
         # Store raw inputs; heavy computation deferred to run_backtest()
         self._alpha_df = alpha_df
         self._prices_df = prices_df
@@ -103,6 +147,81 @@ class NetReturnBacktester:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _build_daily_weights_neutral(
+        self,
+        common_dates: pd.Index,
+        common_stocks: pd.Index,
+    ) -> pd.DataFrame:
+        """Compute industry-neutral daily portfolio weights (Plan B).
+
+        For each (trade_date, industry):
+          - Rank stocks by alpha; select the top ``top_pct`` fraction.
+          - Within the industry, each selected stock gets weight
+            1 / (N_ind_with_top × N_top_in_this_industry).
+
+        Returns
+        -------
+        pd.DataFrame
+            Wide matrix (dates × stocks) of portfolio weights, filling 0 for
+            non-selected stocks.  Rows sum to ~1 on dates with selections.
+        """
+        ind_col = self._industry_col
+
+        # Work in long format — restrict to dates and stocks in scope
+        alpha_long = (
+            self._alpha_df[["trade_date", "ts_code", self.factor_col]]
+            .copy()
+            .query("trade_date in @common_dates and ts_code in @common_stocks")
+            .dropna(subset=[self.factor_col])
+        )
+        alpha_long = alpha_long.merge(
+            self._industry_df, on=["trade_date", "ts_code"], how="left"
+        )
+        # Drop rows where industry is unknown
+        alpha_long = alpha_long.dropna(subset=[ind_col])
+
+        # Intra-industry percentile rank; industries with < 2 stocks → NaN
+        def _ind_pct_rank(x: pd.Series) -> pd.Series:
+            if x.notna().sum() < 2:
+                return pd.Series(np.nan, index=x.index)
+            return x.rank(pct=True, na_option="keep", ascending=True)
+
+        alpha_long["ind_pct"] = (
+            alpha_long.groupby(["trade_date", ind_col])[self.factor_col]
+            .transform(_ind_pct_rank)
+        )
+
+        # Select top fraction within each industry
+        alpha_long["in_top"] = alpha_long["ind_pct"].gt(1.0 - self.top_pct)
+        top_df = alpha_long[alpha_long["in_top"]].copy()
+
+        if top_df.empty:
+            return pd.DataFrame(0.0, index=common_dates, columns=common_stocks)
+
+        # Count selected stocks per (date, industry)
+        top_df["n_top_in_ind"] = (
+            top_df.groupby(["trade_date", ind_col])["ts_code"].transform("count")
+        )
+
+        # Count industries with at least 1 selected stock per date
+        n_ind_map = (
+            top_df.groupby("trade_date")[ind_col].nunique()
+        )
+        top_df["n_ind_with_top"] = top_df["trade_date"].map(n_ind_map)
+
+        # Individual weight: industry-equal-weight (Plan B)
+        top_df["weight"] = 1.0 / (
+            top_df["n_ind_with_top"] * top_df["n_top_in_ind"]
+        )
+
+        # Pivot to wide format and align to (common_dates, common_stocks)
+        daily_w = (
+            top_df.pivot(index="trade_date", columns="ts_code", values="weight")
+            .reindex(index=common_dates, columns=common_stocks)
+            .fillna(0.0)
+        )
+        return daily_w
 
     def _build_return_series(self) -> None:
         """Compute net/gross return and turnover series (vectorised)."""
@@ -118,7 +237,7 @@ class NetReturnBacktester:
         )
 
         # Align to common dates and stocks
-        common_dates = alpha_wide.index.intersection(close_wide.index)
+        common_dates  = alpha_wide.index.intersection(close_wide.index)
         common_stocks = alpha_wide.columns.intersection(close_wide.columns)
         alpha_wide = alpha_wide.reindex(index=common_dates, columns=common_stocks)
         close_wide = close_wide.reindex(index=common_dates, columns=common_stocks)
@@ -126,14 +245,21 @@ class NetReturnBacktester:
         # Day-over-day stock returns
         stock_ret = close_wide.pct_change()
 
-        # Daily G5 (top top_pct%) equal-weight portfolio
-        pct_rank = alpha_wide.rank(axis=1, pct=True)
-        in_top = pct_rank.gt(1.0 - self.top_pct).astype(float)
-        row_sum = in_top.sum(axis=1).replace(0, np.nan)
-        daily_w = in_top.div(row_sum, axis=0).fillna(0.0)
+        # ---- Daily portfolio weights ----
+        if self._industry_col is not None:
+            # Industry-neutral mode (Plan B)
+            daily_w = self._build_daily_weights_neutral(common_dates, common_stocks)
+        else:
+            # Standard mode: global top top_pct% equal-weight
+            pct_rank = alpha_wide.rank(axis=1, pct=True)
+            in_top   = pct_rank.gt(1.0 - self.top_pct).astype(float)
+            row_sum  = in_top.sum(axis=1).replace(0, np.nan)
+            daily_w  = in_top.div(row_sum, axis=0).fillna(0.0)
 
         # Overlapping weight: rolling mean over forward_days buckets
-        overlap_w = daily_w.rolling(window=self.forward_days, min_periods=self.forward_days).mean()
+        overlap_w = daily_w.rolling(
+            window=self.forward_days, min_periods=self.forward_days
+        ).mean()
 
         # Previous-day weights (used to compute return and turnover)
         w_prev = overlap_w.shift(1)
@@ -142,7 +268,9 @@ class NetReturnBacktester:
         gross_ret = (w_prev.fillna(0.0) * stock_ret.fillna(0.0)).sum(axis=1)
 
         # Turnover: half the L1 norm of weight change
-        turnover = 0.5 * (overlap_w.fillna(0.0) - w_prev.fillna(0.0)).abs().sum(axis=1)
+        turnover = 0.5 * (
+            overlap_w.fillna(0.0) - w_prev.fillna(0.0)
+        ).abs().sum(axis=1)
 
         # Net return
         net_ret = gross_ret - turnover * self.cost_rate
@@ -204,10 +332,13 @@ class NetReturnBacktester:
         # Additional cost-aware metrics
         avg_turnover = self._turnover.mean()
         # Breakeven: max daily turnover sustainable while still earning rf net
-        breakeven = (ann_gross_ret - self.rf) / (self.cost_rate * tdy) if self.cost_rate > 0 else float("nan")
+        breakeven = (
+            (ann_gross_ret - self.rf) / (self.cost_rate * tdy)
+            if self.cost_rate > 0 else float("nan")
+        )
 
-        metrics["Avg Daily Turnover"]  = avg_turnover
-        metrics["Breakeven Turnover"]  = breakeven
+        metrics["Avg Daily Turnover"] = avg_turnover
+        metrics["Breakeven Turnover"] = breakeven
 
         self._summary = pd.Series(metrics).round(6)
         return self._summary
@@ -236,10 +367,15 @@ class NetReturnBacktester:
         except Exception:
             dates = pd.to_datetime(cum_nav.index, errors="coerce")
 
+        mode_label = (
+            "Industry-Neutral" if self._industry_col is not None
+            else "Full Cross-Section"
+        )
         fig, ax = plt.subplots(figsize=(12, 5))
         fig.suptitle(
-            f"Net Return (after costs)  —  {self.factor_col}\n"
-            f"cost_rate={self.cost_rate:.2%},  d={self.forward_days}d overlapping",
+            f"Net Return (after costs)  —  {self.factor_col}  [{mode_label}]\n"
+            f"cost_rate={self.cost_rate:.2%},  d={self.forward_days}d overlapping,  "
+            f"top={self.top_pct:.0%} per {'industry' if self._industry_col else 'date'}",
             fontsize=11,
             fontweight="bold",
         )

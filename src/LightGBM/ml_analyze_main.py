@@ -19,7 +19,7 @@ Workflow
 7.  Concatenate all fold predictions; apply 3-day rolling-mean smoothing.
 8.  IC analysis (Spearman IC vs raw forward_return): IC mean / std / ICIR, IC chart.
 9.  Industry-neutral layered backtest (Plan B: industry-equal-weight) → NAV chart.
-10. Net return backtest → net NAV + cost metrics (plots/ml_alpha_net.png).
+10. Industry-neutral net return backtest (Plan B long-only) → NAV + cost metrics.
 11. Average feature importance across folds → bar chart (plots/feature_importance.png).
 12. SHAP beeswarm on last-fold test sample, top-10 features (plots/shap_beeswarm.png).
 13. Write text report to ``result_ml.txt``.
@@ -52,12 +52,12 @@ _LGBM_DIR = pathlib.Path(__file__).parent          # src/LightGBM/
 sys.path.insert(0, str(_LGBM_DIR))
 sys.path.insert(0, str(_ROOT / "src" / "portfolio"))
 
-from targets import calc_forward_return          # noqa: E402
-from ic_analyzer import calc_ic, calc_ic_metrics, plot_ic  # noqa: E402
-from backtester import LayeredBacktester         # noqa: E402
-from net_backtester import NetReturnBacktester   # noqa: E402
-from ml_data_prep import WalkForwardSplitter     # noqa: E402
-from lgbm_model import AlphaLGBM                # noqa: E402
+from targets import calc_forward_return          
+from ic_analyzer import calc_ic, calc_ic_metrics, plot_ic  
+from backtester import LayeredBacktester         
+from net_backtester import NetReturnBacktester   
+from ml_data_prep import WalkForwardSplitter     
+from lgbm_model import AlphaLGBM                
 
 warnings.filterwarnings("ignore")
 
@@ -71,7 +71,7 @@ PLOTS_DIR   = _ROOT / "plots"
 RESULT_FILE = _ROOT / "result_ml.txt"
 
 FORWARD_DAYS: int = 1
-TRAIN_MONTHS: int = 15
+TRAIN_MONTHS: int = 18
 VAL_MONTHS: int = 3
 TEST_MONTHS: int = 3
 EMBARGO_DAYS: int = 1        # must be >= FORWARD_DAYS to prevent target leakage
@@ -362,13 +362,14 @@ def main() -> None:
     _print(perf_table.to_string(), report_buf)
 
     # -----------------------------------------------------------------------
-    # 10. Net return backtest
+    # 10. Net return backtest  (industry-neutral long-only, Plan B)
     # -----------------------------------------------------------------------
-    _section("Net Return Backtest (NetReturnBacktester)", report_buf)
+    _section("Net Return Backtest (NetReturnBacktester, Industry-Neutral)", report_buf)
 
     nb = NetReturnBacktester(
         final_alpha_df,
         prices_df,
+        industry_df=industry_df,
         forward_days=FORWARD_DAYS,
         cost_rate=0.002,
         rf=0.03,

@@ -268,7 +268,7 @@ SHAP beeswarm（最后一折，top-10 特征，n=300 采样）→ shap_beeswarm.
 | 文件 | 类 | 说明 |
 |------|----|------|
 | `src/portfolio/backtester.py` | `LayeredBacktester` | 分层回测：支持全截面与行业中性两种分组模式，计算等权收益、绩效指标与累计净值图 |
-| `src/portfolio/net_backtester.py` | `NetReturnBacktester` | 净收益回测：纯多头重叠组合，含摩擦成本、换手率、盈亏平衡换手率 |
+| `src/portfolio/net_backtester.py` | `NetReturnBacktester` | 净收益回测：支持全截面与行业中性两种选股模式的纯多头重叠组合，含摩擦成本、换手率、盈亏平衡换手率 |
 | `src/portfolio/ic_analyzer.py` | `calc_ic / calc_ic_metrics / plot_ic` | 截面 Spearman IC 评估：计算 IC 序列、均值/标准差/ICIR 指标、绘制时序图 |
 
 #### `LayeredBacktester` 行业中性分层回测（方案 B）
@@ -303,6 +303,39 @@ perf_table = bt.run_backtest()
 ```
 
 `industry_df=None`（默认值）时退化为原来的全截面 qcut 模式，保持向后兼容。
+
+#### `NetReturnBacktester` 行业中性纯多头回测（方案 B）
+
+`NetReturnBacktester` 同样新增可选参数 `industry_df`，传入时切换为**行业中性选股**模式，与 `LayeredBacktester` 的方案 B 保持对称。
+
+**权重构造（两步）：**
+
+1. **行业内选股**：在每个 `(trade_date, industry)` 截面内，按因子值百分位选出前 `top_pct`（默认 20%）的股票。少于 2 只股票的行业当日不参与选股。
+
+2. **行业等权合成（Plan B）**：每只被选中的股票权重为：
+   \[
+   w_s = \frac{1}{N_{\text{ind\_with\_top}} \times N_{\text{top\_in\_industry}(s)}}
+   \]
+   其中 $N_{\text{ind\_with\_top}}$ 为当日至少贡献一只股票的行业数，$N_{\text{top\_in\_industry}(s)}$ 为股票 $s$ 所在行业当日被选中的股票数。整个组合权重合计为 1，每个行业贡献相同。
+
+后续重叠权重、换手率、净收益的计算逻辑与标准模式完全相同。
+
+**接口示例：**
+
+```python
+from net_backtester import NetReturnBacktester
+
+nb = NetReturnBacktester(
+    final_alpha_df,        # [trade_date, ts_code, ml_alpha]
+    prices_df,             # [trade_date, ts_code, close, ...]
+    industry_df=industry_df,   # 新增参数，传入时启用行业中性模式
+    forward_days=1,
+    cost_rate=0.002,
+    rf=0.03,
+    plots_dir=PLOTS_DIR,
+)
+summary = nb.run_backtest()
+```
 
 后续阶段将在此目录下继续添加风险约束、组合优化等模块。
 

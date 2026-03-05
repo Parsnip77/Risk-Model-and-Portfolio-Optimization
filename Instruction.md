@@ -26,7 +26,9 @@
 │   ├── prices.parquet                       # 日线行情 + 复权因子 + 可交易标志
 │   ├── meta.parquet                         # 每日基本面 + 申万一级行业
 │   ├── factors_raw.parquet                  # 原始因子值（保留 NaN）
-│   └── factors_clean.parquet               # 清洗后因子值（百分位排名，不可交易为 NaN）
+│   ├── factors_clean.parquet               # 清洗后因子值（百分位排名，不可交易为 NaN）
+│   ├── ml_alpha.parquet                     # 第二阶段输出的合成 alpha 信号（ml_analyze_main.py 生成）
+│   └── index.parquet                        # CSI 300 指数每日收盘价（data_preparation_main.py 生成）
 ├── plots/                                   # 图表输出目录
 ├── src/
 │   ├── data_preparation/                    # 第一阶段
@@ -45,8 +47,11 @@
 │   └── portfolio/                           # 第四阶段
 │       ├── __init__.py
 │       ├── backtester.py                    # LayeredBacktester：分层回测
-│       ├── net_backtester.py               # NetReturnBacktester：净收益回测
-│       └── ic_analyzer.py                  # IC 评估：calc_ic / calc_ic_metrics / plot_ic
+│       ├── net_backtester.py               # NetReturnBacktester：净收益回测（含 benchmark 超额收益）
+│       ├── ic_analyzer.py                  # IC 评估：calc_ic / calc_ic_metrics / plot_ic
+│       ├── optimizer.py                     # PortfolioOptimizer：cvxpy LP 凸优化求解器
+│       ├── optimization_backtester.py      # OptimizationBacktester：优化组合回测（含 benchmark 超额收益）
+│       └── optimization_main.py            # 第四阶段总脚本
 ├── .gitignore
 ├── requirements.txt
 └── Instruction.md
@@ -338,17 +343,23 @@ perf_table = bt.run_backtest()
 
 ```python
 from net_backtester import NetReturnBacktester
+import pandas as pd
+
+index_prices = pd.read_parquet("data/index.parquet").set_index("trade_date")["close"]
 
 nb = NetReturnBacktester(
     final_alpha_df,        # [trade_date, ts_code, ml_alpha]
     prices_df,             # [trade_date, ts_code, open, close, ...]  需包含 open 列
-    industry_df=industry_df,   # 新增参数，传入时启用行业中性模式
+    industry_df=industry_df,   # 传入时启用行业中性选股
     forward_days=1,
     cost_rate=0.002,
     rf=0.03,
     plots_dir=PLOTS_DIR,
+    benchmark_prices=index_prices,  # 可选；传入时生成超额收益指标+双面板图
 )
 summary = nb.run_backtest()
+# summary 额外包含: Bench Ann Return, Excess Ann Return,
+#                   Tracking Error, Information Ratio, Max Relative DD
 ```
 
 #### 凸优化组合管理（第四阶段新增）
@@ -391,6 +402,12 @@ $$\max_{w_t}\ w_t^\top\hat\alpha_t - \lambda\cdot\tfrac{1}{2}\|w_t - w_{t-1}\|_1
 4. **行业约束动态基准**：基准权重每日更新（不使用静态值），反映 CSI 300 真实行业构成变化。
 5. **不可行日自动处理**：$\delta$ 依次扩大（0.01 → 0.02 → ... → 0.05），所有容差均失败时去掉行业约束求解，报告中记录发生次数。
 6. **首日初始化**：$w_0 = \mathbf{0}$（空仓），第一个有效日完整买入，换手率≈100% 计入成本。
+7. **基准超额收益分析**：`NetReturnBacktester` 和 `OptimizationBacktester` 均支持可选的 `benchmark_prices` 参数（CSI 300 每日收盘价 Series）。传入后会：
+   - 计算超额日收益 `excess_ret = strategy_ret - bench_ret`；
+   - 在 `run_backtest()` 报告中追加五项指标：`Bench Ann Return`、`Excess Ann Return`、`Tracking Error`、`Information Ratio`、`Max Relative DD`；
+   - 将图表改为**双面板**：上栏绝对净值（策略蓝色 + 沪深300橙色）、下栏超额净值（绿色，基准为 1.0 水平线）并标注 IR / Tracking Error。
+   - `benchmark_prices=None`（默认）时行为与原始版本完全相同（向后兼容）。
+   - 基准来源：`data/index.parquet`（由 `data_preparation_main.py` 生成，内含 `[trade_date, close]` 两列）。
 
 ##### 运行方式
 

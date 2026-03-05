@@ -70,11 +70,11 @@ DATA_DIR    = _ROOT / "data"
 PLOTS_DIR   = _ROOT / "plots"
 RESULT_FILE = _ROOT / "result_ml.txt"
 
-FORWARD_DAYS: int = 1
+FORWARD_DAYS: int = 5
 TRAIN_MONTHS: int = 18
 VAL_MONTHS: int = 3
 TEST_MONTHS: int = 3
-EMBARGO_DAYS: int = 1        # must be >= FORWARD_DAYS to prevent target leakage
+EMBARGO_DAYS: int = 5        # must be >= FORWARD_DAYS to prevent target leakage
 SHAP_SAMPLE_SIZE: int = 300  # rows sub-sampled for SHAP (speed)
 SHAP_TOP_N: int = 10         # features displayed in beeswarm
 
@@ -150,6 +150,7 @@ def main() -> None:
     factors_path = DATA_DIR / "factors_clean.parquet"
     prices_path  = DATA_DIR / "prices.parquet"
     meta_path    = DATA_DIR / "meta.parquet"
+    index_path   = DATA_DIR / "index.parquet"
 
     for p in (factors_path, prices_path, meta_path):
         if not p.exists():
@@ -168,9 +169,22 @@ def main() -> None:
         if isinstance(df.index, pd.MultiIndex):
             df.reset_index(inplace=True)
 
+    # CSI 300 index prices for benchmark comparison (optional: skip if file missing)
+    index_prices: pd.Series | None = None
+    if index_path.exists():
+        index_prices = (
+            pd.read_parquet(index_path)
+            .set_index("trade_date")["close"]
+        )
+
     _print(f"   factors shape : {factors_df.shape}", report_buf)
     _print(f"   prices  shape : {prices_df.shape}", report_buf)
     _print(f"   meta    shape : {meta_df.shape}", report_buf)
+    _print(
+        f"   index prices  : {len(index_prices)} rows"
+        if index_prices is not None else "   index prices  : not found (no benchmark comparison)",
+        report_buf,
+    )
 
     # -----------------------------------------------------------------------
     # 2. Raw forward returns
@@ -379,6 +393,7 @@ def main() -> None:
         cost_rate=0.002,
         rf=0.03,
         plots_dir=PLOTS_DIR,
+        benchmark_prices=index_prices,
     )
     net_summary = nb.run_backtest()
     nb.plot(show=False)

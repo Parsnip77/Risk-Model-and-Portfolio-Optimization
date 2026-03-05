@@ -48,9 +48,13 @@ Execution assumption (open-to-open, no look-ahead bias)
 --------------------------------------------------------
 Signal is computed from data available at the close of day T.  The trade
 executes at the OPEN of day T+1 and is held until the OPEN of day T+2.
-Realised portfolio return each period is therefore the open-to-open return:
+The portfolio gross return on accounting day T is therefore:
 
-    stock_ret[T] = open_T / open_{T-1} - 1
+    gross_ret[T] = w_{T-1} × (open_{T+1} / open_T - 1)
+
+Implemented by shifting stock_ret_wide by -1 before the main loop, so
+    stock_ret_wide.loc[T] = open_{T+1} / open_T - 1   (forward return)
+and gross_ret[T] = w_full (set at T-1) × stock_ret_wide.loc[T].
 
 This is consistent with ``calc_forward_return`` in targets.py, which sets
     forward_return_T = open_{T+2} / open_{T+1} - 1
@@ -158,6 +162,7 @@ class OptimizationBacktester:
         max_weight: float = 0.05,
         industry_tol: float = 0.01,
         plots_dir: Optional[pathlib.Path | str] = None,
+        benchmark_prices: Optional[pd.Series] = None,
     ) -> None:
         # Identify alpha column
         key_cols = {"trade_date", "ts_code"}
@@ -173,6 +178,10 @@ class OptimizationBacktester:
         self.max_weight = max_weight
         self.industry_tol = industry_tol
         self.plots_dir = pathlib.Path(plots_dir) if plots_dir is not None else None
+
+        # Benchmark (optional): CSI 300 close-price Series (index=trade_date)
+        # Returns are computed internally via pct_change() to keep the caller simple.
+        self._benchmark_prices: Optional[pd.Series] = benchmark_prices
 
         self._alpha_df  = alpha_df
         self._prices_df = prices_df
@@ -211,6 +220,52 @@ class OptimizationBacktester:
             "Max DD":     mdd,
         }
 
+    def _calc_excess_metrics(self, net_ret: pd.Series) -> dict:
+        """Compute benchmark-relative excess return metrics.
+
+        Uses close-to-close CSI 300 index returns as benchmark.  The portfolio
+        uses open-to-open returns, so there is a ~0.5-day timing offset, but
+        this is immaterial for monthly/annual-level metrics such as IR.
+
+        Parameters
+        ----------
+        net_ret : pd.Series
+            Daily net portfolio returns, index = trade_date.
+
+        Returns
+        -------
+        dict with keys:
+            Bench Ann Return, Excess Ann Return, Tracking Error,
+            Information Ratio, Max Relative DD.
+        """
+        tdy = self.TRADING_DAYS_PER_YEAR
+
+        bench_ret = self._benchmark_prices.pct_change()
+        bench_ret = bench_ret.reindex(net_ret.index).fillna(0.0)
+
+        n = len(net_ret)
+        bench_cum   = float((1 + bench_ret).prod() - 1)
+        bench_ann   = (1 + bench_cum) ** (tdy / n) - 1
+
+        excess_ret  = net_ret.values - bench_ret.values
+        excess_mean = float(np.mean(excess_ret))
+        excess_std  = float(np.std(excess_ret, ddof=1))
+
+        exc_ann_ret = excess_mean * tdy
+        track_err   = excess_std * math.sqrt(tdy)
+        ir = exc_ann_ret / track_err if track_err != 0 else float("nan")
+
+        excess_nav  = (1 + pd.Series(excess_ret, index=net_ret.index)).cumprod()
+        max_rel_dd  = float((excess_nav / excess_nav.cummax() - 1).min())
+
+        return {
+            "Bench Ann Return":  round(bench_ann,   6),
+            "Excess Ann Return": round(exc_ann_ret,  6),
+            "Tracking Error":    round(track_err,    6),
+            "Information Ratio": round(ir,           6),
+            "Max Relative DD":   round(max_rel_dd,   6),
+        }
+
     def _build_return_series(self) -> None:
         """Core loop: call the optimiser for each day and accumulate returns.
 
@@ -218,11 +273,13 @@ class OptimizationBacktester:
         ---------------------------------------------------------
         The portfolio decision for day T is made from the alpha signal computed
         at the close of day T.  The trade executes at the OPEN of day T+1 and
-        is held until the OPEN of day T+2.  Therefore, the realised stock return
-        each period is the consecutive open-to-open return:
+        is held until the OPEN of day T+2.  The portfolio gross return on
+        accounting day T is:
 
-            stock_ret[T] = open_T / open_{T-1} - 1
+            gross_ret[T] = w_{T-1} × (open_{T+1} / open_T - 1)
 
+        stock_ret_wide is shifted by -1 before the loop so that
+        stock_ret_wide.loc[T] = open_{T+1} / open_T - 1 (forward return).
         This aligns exactly with ``calc_forward_return`` in targets.py:
             forward_return_T = open_{T+2} / open_{T+1} - 1
         ensuring that what the LP maximises (expected forward return) matches
@@ -259,7 +316,11 @@ class OptimizationBacktester:
         tradable_wide = tradable_wide.reindex(
             index=all_dates, columns=all_stocks, fill_value=False
         )
-        stock_ret_wide = open_wide.pct_change()   # recompute after reindex
+        stock_ret_wide = open_wide.pct_change()        # recompute after reindex
+        # Shift by -1: stock_ret_wide.loc[T] now = open[T+1]/open[T] - 1
+        # so that gross[T] = w_full (set at T-1) × forward return (T→T+1),
+        # consistent with: signal at T-1 close → enter T open → exit T+1 open.
+        stock_ret_wide = stock_ret_wide.shift(-1)
 
         # Prepare meta (for industry labels and market cap)
         meta_cols = ["trade_date", "ts_code", "industry", "total_mv"]
@@ -465,11 +526,18 @@ class OptimizationBacktester:
             1 for e in self._relax_log if "relaxed" in e.get("message", "")
         )
 
+        if self._benchmark_prices is not None:
+            metrics.update(self._calc_excess_metrics(self._net_ret))
+
         self._summary = pd.Series(metrics).round(6)
         return self._summary
 
     def plot(self, show: bool = False) -> plt.Figure:
         """Plot the cumulative net return NAV curve.
+
+        When ``benchmark_prices`` was provided, the figure contains two panels:
+          - Top: absolute NAV (strategy in blue, CSI 300 in orange)
+          - Bottom: excess NAV = (1 + excess_daily_ret).cumprod(), starting at 1
 
         Saves to ``plots_dir/optimization_nav.png`` when ``plots_dir`` is set.
         """
@@ -482,42 +550,128 @@ class OptimizationBacktester:
         except Exception:
             dates = pd.to_datetime(cum_nav.index, errors="coerce")
 
-        fig, ax = plt.subplots(figsize=(12, 5))
-        fig.suptitle(
+        title = (
             f"Optimised Portfolio — Net Return (after costs)\n"
             f"lambda_TO={self.lambda_turnover},  cost={self.cost_rate:.2%},  "
-            f"max_w={self.max_weight:.0%},  ind_tol=±{self.industry_tol:.0%}",
-            fontsize=11,
-            fontweight="bold",
+            f"max_w={self.max_weight:.0%},  ind_tol=±{self.industry_tol:.0%}"
         )
 
-        ax.plot(dates, cum_nav.values, color="#1565C0", linewidth=1.8,
-                label="Optimised Net NAV")
-        ax.axhline(1.0, color="grey", linewidth=0.8, linestyle=":")
-        ax.set_ylabel("Cumulative NAV")
-        ax.legend(loc="upper left", fontsize=9)
-        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
+        has_bench = self._benchmark_prices is not None
 
-        if self._summary is not None:
-            txt = (
-                f"Ann Ret : {self._summary['Ann Return']:+.2%}\n"
-                f"Sharpe  : {self._summary['Sharpe']:.3f}\n"
-                f"Max DD  : {self._summary['Max DD']:.2%}\n"
-                f"Avg TO  : {self._summary['Avg Daily Turnover']:.4f}"
-            )
-            ax.text(
-                0.88, 0.05, txt,
-                transform=ax.transAxes,
-                fontsize=8,
-                verticalalignment="bottom",
-                bbox=dict(boxstyle="round,pad=0.4", alpha=0.15),
-            )
+        if has_bench:
+            bench_ret = self._benchmark_prices.pct_change().reindex(
+                self._net_ret.index
+            ).fillna(0.0)
+            bench_nav = (1 + bench_ret).cumprod()
+            excess_ret = self._net_ret.values - bench_ret.values
+            excess_nav = (
+                1 + pd.Series(excess_ret, index=self._net_ret.index)
+            ).cumprod()
+            try:
+                bench_dates = pd.to_datetime(
+                    bench_nav.index.astype(str), format="%Y%m%d"
+                )
+            except Exception:
+                bench_dates = pd.to_datetime(bench_nav.index, errors="coerce")
 
-        locator   = mdates.AutoDateLocator(minticks=6, maxticks=12)
-        formatter = mdates.DateFormatter("%Y-%m")
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(formatter)
-        fig.autofmt_xdate(rotation=30)
+            fig, (ax_abs, ax_exc) = plt.subplots(
+                2, 1, figsize=(12, 8), sharex=True
+            )
+            fig.suptitle(title, fontsize=11, fontweight="bold")
+
+            # Top panel: absolute NAV
+            ax_abs.plot(
+                dates, cum_nav.values,
+                color="#1565C0", linewidth=1.8, label="Optimised Net NAV",
+            )
+            ax_abs.plot(
+                bench_dates, bench_nav.values,
+                color="#E65100", linewidth=1.5, linestyle="--", label="CSI 300",
+            )
+            ax_abs.axhline(1.0, color="grey", linewidth=0.8, linestyle=":")
+            ax_abs.set_ylabel("Cumulative NAV")
+            ax_abs.legend(loc="upper left", fontsize=9)
+            ax_abs.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
+
+            if self._summary is not None:
+                txt = (
+                    f"Ann Ret : {self._summary['Ann Return']:+.2%}\n"
+                    f"Sharpe  : {self._summary['Sharpe']:.3f}\n"
+                    f"Max DD  : {self._summary['Max DD']:.2%}\n"
+                    f"Avg TO  : {self._summary['Avg Daily Turnover']:.4f}"
+                )
+                ax_abs.text(
+                    0.015, 0.05, txt,
+                    transform=ax_abs.transAxes,
+                    fontsize=8,
+                    verticalalignment="bottom",
+                    bbox=dict(boxstyle="round,pad=0.4", alpha=0.15),
+                )
+
+            # Bottom panel: excess NAV
+            ax_exc.plot(
+                dates, excess_nav.values,
+                color="#2E7D32", linewidth=1.8, label="Excess NAV (vs CSI 300)",
+            )
+            ax_exc.axhline(1.0, color="grey", linewidth=0.8, linestyle=":")
+            ax_exc.set_ylabel("Excess NAV")
+            ax_exc.legend(loc="upper left", fontsize=9)
+            ax_exc.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
+
+            if self._summary is not None and "Information Ratio" in self._summary:
+                exc_txt = (
+                    f"Excess Ann Ret : {self._summary['Excess Ann Return']:+.2%}\n"
+                    f"Info Ratio     : {self._summary['Information Ratio']:.3f}\n"
+                    f"Tracking Error : {self._summary['Tracking Error']:.2%}\n"
+                    f"Max Rel DD     : {self._summary['Max Relative DD']:.2%}"
+                )
+                ax_exc.text(
+                    0.015, 0.05, exc_txt,
+                    transform=ax_exc.transAxes,
+                    fontsize=8,
+                    verticalalignment="bottom",
+                    bbox=dict(boxstyle="round,pad=0.4", alpha=0.15),
+                )
+
+            locator   = mdates.AutoDateLocator(minticks=6, maxticks=12)
+            formatter = mdates.DateFormatter("%Y-%m")
+            ax_exc.xaxis.set_major_locator(locator)
+            ax_exc.xaxis.set_major_formatter(formatter)
+            fig.autofmt_xdate(rotation=30)
+
+        else:
+            # No benchmark: single-panel (original behaviour)
+            fig, ax = plt.subplots(figsize=(12, 5))
+            fig.suptitle(title, fontsize=11, fontweight="bold")
+
+            ax.plot(dates, cum_nav.values, color="#1565C0", linewidth=1.8,
+                    label="Optimised Net NAV")
+            ax.axhline(1.0, color="grey", linewidth=0.8, linestyle=":")
+            ax.set_ylabel("Cumulative NAV")
+            ax.legend(loc="upper left", fontsize=9)
+            ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
+
+            if self._summary is not None:
+                txt = (
+                    f"Ann Ret : {self._summary['Ann Return']:+.2%}\n"
+                    f"Sharpe  : {self._summary['Sharpe']:.3f}\n"
+                    f"Max DD  : {self._summary['Max DD']:.2%}\n"
+                    f"Avg TO  : {self._summary['Avg Daily Turnover']:.4f}"
+                )
+                ax.text(
+                    0.88, 0.05, txt,
+                    transform=ax.transAxes,
+                    fontsize=8,
+                    verticalalignment="bottom",
+                    bbox=dict(boxstyle="round,pad=0.4", alpha=0.15),
+                )
+
+            locator   = mdates.AutoDateLocator(minticks=6, maxticks=12)
+            formatter = mdates.DateFormatter("%Y-%m")
+            ax.xaxis.set_major_locator(locator)
+            ax.xaxis.set_major_formatter(formatter)
+            fig.autofmt_xdate(rotation=30)
+
         fig.tight_layout()
 
         if self.plots_dir is not None:

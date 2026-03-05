@@ -263,6 +263,13 @@ def main() -> None:
     _ok(f"factors_clean.parquet : {clean_out.shape[0]:>7,} rows | {len(factor_cols)} factor cols"
         f" | non-tradable = NaN")
 
+    # -- index.parquet (CSI 300 daily close) --------------------------
+    idx_out = df_index.reset_index().rename(
+        columns={"date": "trade_date", "close": "close"}
+    )
+    idx_out.to_parquet(out_dir / "index.parquet", index=False)
+    _ok(f"index.parquet         : {len(idx_out):>7,} rows | CSI 300 daily close")
+
     _step("Complete")
     _ok(f"All files saved to: {out_dir.resolve()}")
     print()

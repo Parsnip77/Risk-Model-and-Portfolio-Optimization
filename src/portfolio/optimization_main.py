@@ -79,7 +79,7 @@ RESULT_FILE = _ROOT / "result_optimization.txt"
 
 # --- Two separate cost-related parameters (do NOT merge into one) -----------
 
-LAMBDA_TURNOVER: float = 0.00
+LAMBDA_TURNOVER: float = 0.01
 # Turnover-aversion coefficient in the LP objective.  Dimensionless policy knob.
 # Because alpha is in rank-score units (~±0.5 after de-meaning), NOT return
 # units (~±0.01), using the monetary cost rate (0.002) here would make the
@@ -88,15 +88,15 @@ LAMBDA_TURNOVER: float = 0.00
 #   0.2~0.5   → moderate,   Avg Daily Turnover ~2–8 %  ← recommended start
 #   1.0+      → very stable, slow signal tracking
 
-COST_RATE: float = 0.00
+COST_RATE: float = 0.0001
 # Actual one-way transaction cost rate for P&L deduction only.
 # Applied as: net_return = gross_return - turnover * COST_RATE.
 # Do not use this as the optimiser penalty; see LAMBDA_TURNOVER above.
 
 # --- Other optimiser settings -----------------------------------------------
 RF:             float = 0.03     # annual risk-free rate
-MAX_WEIGHT:     float = 0.02     # per-stock weight cap
-INDUSTRY_TOL:   float = 1     # initial industry deviation tolerance (±1 pp)
+MAX_WEIGHT:     float = 0.05     # per-stock weight cap
+INDUSTRY_TOL:   float = 0.01     # initial industry deviation tolerance (±1 pp)
 
 # ---------------------------------------------------------------------------
 # Console helpers
@@ -151,9 +151,23 @@ def main() -> None:
         if isinstance(df.index, pd.MultiIndex):
             df.reset_index(inplace=True)
 
+    # CSI 300 index prices for benchmark comparison (optional: skip if file missing)
+    index_path = DATA_DIR / "index.parquet"
+    index_prices: pd.Series | None = None
+    if index_path.exists():
+        index_prices = (
+            pd.read_parquet(index_path)
+            .set_index("trade_date")["close"]
+        )
+
     _print(f"   ml_alpha shape : {alpha_df.shape}", report_buf)
     _print(f"   prices   shape : {prices_df.shape}", report_buf)
     _print(f"   meta     shape : {meta_df.shape}", report_buf)
+    _print(
+        f"   index prices  : {len(index_prices)} rows"
+        if index_prices is not None else "   index prices  : not found (no benchmark comparison)",
+        report_buf,
+    )
     _print(
         f"   alpha date range : {alpha_df['trade_date'].min()} → "
         f"{alpha_df['trade_date'].max()}",
@@ -194,12 +208,13 @@ def main() -> None:
         alpha_df,
         prices_df,
         meta_df,
-        cost_rate=COST_RATE,           # P&L cost deduction rate
+        cost_rate=COST_RATE,              # P&L cost deduction rate
         lambda_turnover=LAMBDA_TURNOVER,  # optimiser penalty coefficient
         rf=RF,
         max_weight=MAX_WEIGHT,
         industry_tol=INDUSTRY_TOL,
         plots_dir=PLOTS_DIR,
+        benchmark_prices=index_prices,    # CSI 300 for excess-return metrics
     )
 
     summary = obt.run_backtest()

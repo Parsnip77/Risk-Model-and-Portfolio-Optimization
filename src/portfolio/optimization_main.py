@@ -102,6 +102,15 @@ FORWARD_DAYS:   int   = 1        # holding period; must match ml_analyze_main
                                  # (alpha predicts d-day return).  When > 1,
                                  # uses overlapping portfolio to reduce turnover.
 
+# --- Stage 3 Risk Model (requires risk_model_main.py to be run first) -------
+USE_RISK_MODEL: bool        = True  # True = load risk model parquet files
+MU_RISK:        float       = 0.0    # risk-aversion penalty coefficient
+                                     # 0.0 = disabled; try 1000~10000 when active
+                                     # alpha scale (~0.5) / risk_quad scale (~1e-4)
+                                     # => mu_risk ~5000 for equal weighting
+MAX_VARIANCE:   float | None = 0.00  # daily portfolio variance hard cap (w^T Σ w)
+                                     # None = disabled; e.g. 2e-4 ≈ (1.4%/day)^2
+
 # ---------------------------------------------------------------------------
 # Console helpers
 # ---------------------------------------------------------------------------
@@ -185,6 +194,7 @@ def main() -> None:
     _print(
         textwrap.dedent(f"""
         Objective  : max  w' alpha_centered - lambda_TO/2 * ||w - w_prev||_1
+                          - 1/2 * mu_risk * w^T Σ w  (if USE_RISK_MODEL)
                      (alpha_centered = alpha - cross_sectional_mean(alpha))
 
         lambda_turnover : {LAMBDA_TURNOVER}
@@ -199,7 +209,10 @@ def main() -> None:
         Max turnover         : {f'{MAX_TURNOVER:.0%}' if MAX_TURNOVER is not None else 'None (disabled)'}
         Industry neutrality  : ±{INDUSTRY_TOL:.0%} tolerance (auto-relax up to ±5%)
         Forward days (d)     : {FORWARD_DAYS}  (overlapping portfolio when > 1)
-        Solver               : CLARABEL (cvxpy default for LP)
+        Risk model           : {'ON' if USE_RISK_MODEL else 'OFF'}
+        mu_risk              : {MU_RISK}  (risk-aversion coefficient; 0 = disabled)
+        max_variance         : {MAX_VARIANCE if MAX_VARIANCE is not None else 'None (disabled)'}
+        Solver               : CLARABEL (cvxpy default for LP/SOCP)
         """).strip(),
         report_buf,
     )
@@ -220,7 +233,10 @@ def main() -> None:
         max_weight=MAX_WEIGHT,
         industry_tol=INDUSTRY_TOL,
         max_turnover=MAX_TURNOVER,        # daily turnover cap; None=disabled
-        forward_days=FORWARD_DAYS,       # match alpha prediction horizon
+        forward_days=FORWARD_DAYS,        # match alpha prediction horizon
+        use_risk_model=USE_RISK_MODEL,    # Stage 3 risk model integration
+        mu_risk=MU_RISK,                  # risk-aversion penalty coefficient
+        max_variance=MAX_VARIANCE,        # daily variance hard cap; None=disabled
         plots_dir=PLOTS_DIR,
         benchmark_prices=index_prices,    # CSI 300 for excess-return metrics
     )

@@ -6,12 +6,14 @@ Convex portfolio optimiser for the long-only, industry-neutral strategy.
 Problem (per trading day t)
 ----------------------------
     max_{w}  w' alpha_centered  -  lambda_turnover/2 * ||w - w_prev||_1
+             - 1/2 * mu_risk * w^T Σ w                (optional risk penalty)
 
     s.t.  sum(w) = 1                           (fully invested)
           w >= 0                                (long only)
           w <= max_weight                       (single-stock cap)
           0.5||w - w_prev||_1 <= max_turnover   (daily turnover cap, if set)
           |X_ind' w - w_bench| <= tol           (industry neutrality)
+          1/2 w^T Σ w <= max_variance           (optional risk limit)
 
 where
     w              : portfolio weights, shape (n,)
@@ -19,13 +21,39 @@ where
                      Caller is responsible for de-meaning before calling solve().
                      Typical range after de-meaning: [-0.5, 0.5]
     w_prev         : previous-day weights, shape (n,)
-    X_ind          : industry dummy matrix, shape (n, K)
-    w_bench        : benchmark industry weights, shape (K,)
+    X_ind          : industry dummy matrix, shape (n, K_ind)
+    w_bench        : benchmark industry weights, shape (K_ind,)
     lambda_turnover: turnover-aversion coefficient in the objective (default 0.2).
                      This is NOT a transaction cost rate; it is a dimensionless
                      policy parameter controlling the trade-off between alpha
                      capture and portfolio stability.  See parameter docs below.
     tol            : industry deviation tolerance (default ±0.01)
+    Σ              : covariance matrix estimated from multi-factor risk model.
+                     Decomposed as Σ = X_risk F X_risk^T + Δ for efficiency.
+
+Risk model integration (optional)
+----------------------------------
+When X_risk, F_half, delta_std are passed to solve(), the quadratic risk term
+is computed without constructing the full N×N matrix:
+
+    w^T Σ w = ||F_half @ (X_risk^T w)||² + ||delta_std ⊙ w||²
+
+where
+    X_risk   : (n, K) factor exposure matrix (style + industry, from risk model)
+    F_half   : (K, K) upper Cholesky factor of F_t  (F = F_half.T @ F_half)
+    delta_std: (n,) per-stock idiosyncratic standard deviation (sqrt of Δ_{ii})
+
+This decomposition enables cvxpy to represent the risk term as a sum of
+squared norms (SOCP), which CLARABEL solves natively and efficiently.
+
+mu_risk calibration
+--------------------
+alpha is in rank-score units (~±0.5 after de-meaning).
+risk_quad (w^T Σ w) is in daily-variance units (~0.0001 for a diversified portfolio).
+To make the risk penalty comparable to the alpha term:
+    mu_risk ≈ alpha_scale / risk_scale ≈ 0.5 / 0.0001 = 5000
+Recommended starting range: 1000–10000.
+Inspect 'Avg Daily Variance' in the backtest report to calibrate.
 
 Two-parameter design
 ---------------------
@@ -57,8 +85,9 @@ Public API
 ----------
     opt = PortfolioOptimizer(lambda_turnover=0.2, max_weight=0.05,
                              max_turnover=0.10, industry_tol=0.01,
-                             industry_tol_max=0.05, industry_tol_step=0.01)
-    w_star, tol_used = opt.solve(alpha_centered_t, w_prev, X_industry, w_benchmark)
+                             mu_risk=0.0, max_variance=None)
+    w_star, tol_used = opt.solve(alpha_t, w_prev, X_industry, w_benchmark,
+                                 X_risk=X_t, F_half=L_T, delta_std=delta_t)
 """
 
 from __future__ import annotations
@@ -78,7 +107,7 @@ except ImportError as exc:
 
 
 class PortfolioOptimizer:
-    """Convex LP-based portfolio optimiser with automatic industry-tol relaxation.
+    """Convex portfolio optimiser (LP/SOCP) with automatic industry-tol relaxation.
 
     Parameters
     ----------
@@ -115,8 +144,18 @@ class PortfolioOptimizer:
         Upper bound on the relaxed tolerance (default 0.05 = ±5 pp).
     industry_tol_step : float
         Step size for relaxing the tolerance on each retry (default 0.01).
+    mu_risk : float
+        Risk-aversion coefficient for the quadratic risk penalty (default 0.0).
+        Adds term: -0.5 * mu_risk * w^T Σ w to the objective.
+        Set to 0.0 to disable.  Typical calibration range: 1000–10000.
+        Only active when X_risk, F_half, delta_std are passed to solve().
+        See module docstring for calibration guidance.
+    max_variance : float or None
+        Hard upper bound on daily portfolio variance: w^T Σ w <= 2*max_variance.
+        None (default) disables this constraint.
+        Only active when X_risk, F_half, delta_std are passed to solve().
     solver : str or None
-        cvxpy solver name.  None lets cvxpy choose (typically CLARABEL for LP).
+        cvxpy solver name.  None lets cvxpy choose (CLARABEL supports LP and SOCP).
     """
 
     def __init__(
@@ -127,15 +166,19 @@ class PortfolioOptimizer:
         industry_tol_max: float = 0.05,
         industry_tol_step: float = 0.01,
         max_turnover: Optional[float] = 0.10,
+        mu_risk: float = 0.0,
+        max_variance: Optional[float] = None,
         solver: Optional[str] = None,
     ) -> None:
-        self.lambda_turnover = lambda_turnover
-        self.max_weight = max_weight
-        self.max_turnover = max_turnover
-        self.industry_tol = industry_tol
-        self.industry_tol_max = industry_tol_max
+        self.lambda_turnover   = lambda_turnover
+        self.max_weight        = max_weight
+        self.max_turnover      = max_turnover
+        self.industry_tol      = industry_tol
+        self.industry_tol_max  = industry_tol_max
         self.industry_tol_step = industry_tol_step
-        self.solver = solver
+        self.mu_risk           = mu_risk
+        self.max_variance      = max_variance
+        self.solver            = solver
 
     # ------------------------------------------------------------------
     # Public API
@@ -147,6 +190,9 @@ class PortfolioOptimizer:
         w_prev: np.ndarray,
         X_industry: np.ndarray,
         w_benchmark: np.ndarray,
+        X_risk: Optional[np.ndarray] = None,
+        F_half: Optional[np.ndarray] = None,
+        delta_std: Optional[np.ndarray] = None,
     ) -> tuple[np.ndarray, Optional[float]]:
         """Solve the portfolio optimisation problem for a single day.
 
@@ -162,10 +208,18 @@ class PortfolioOptimizer:
         w_prev : np.ndarray, shape (n,)
             Previous-day portfolio weights for the same universe.
             New-to-universe stocks should be initialised to 0.
-        X_industry : np.ndarray, shape (n, K)
+        X_industry : np.ndarray, shape (n, K_ind)
             Binary industry dummy matrix.
-        w_benchmark : np.ndarray, shape (K,)
+        w_benchmark : np.ndarray, shape (K_ind,)
             Benchmark industry weight vector (sums to 1).
+        X_risk : np.ndarray or None, shape (n, K)
+            Factor exposure matrix from the risk model (style + industry factors).
+            If all three risk inputs are provided, the risk term is activated.
+        F_half : np.ndarray or None, shape (K, K)
+            Upper Cholesky factor of the factor covariance matrix F_t.
+            Satisfies: F = F_half.T @ F_half.
+        delta_std : np.ndarray or None, shape (n,)
+            Per-stock idiosyncratic standard deviation (sqrt(Δ_{ii})).
 
         Returns
         -------
@@ -194,9 +248,31 @@ class PortfolioOptimizer:
         # Objective: maximise alpha return minus turnover-aversion penalty.
         # lambda_turnover controls the signal-vs-stability trade-off;
         # it is NOT a monetary cost rate (see class docstring).
-        objective = cp.Maximize(
-            w @ alpha_t - self.lambda_turnover * 0.5 * cp.norm1(w - w_prev)
+        obj_expr = w @ alpha_t - self.lambda_turnover * 0.5 * cp.norm1(w - w_prev)
+
+        # Optional risk penalty: -0.5 * mu_risk * w^T Σ w
+        # Decomposed as: w^T Σ w = ||F_half @ (X_risk^T w)||² + ||delta_std ⊙ w||²
+        # This avoids forming the full N×N covariance matrix and enables SOCP.
+        risk_active = (
+            X_risk is not None
+            and F_half is not None
+            and delta_std is not None
         )
+        risk_quad = None
+        if risk_active:
+            X_r  = np.asarray(X_risk,    dtype=float)   # (n, K)
+            F_h  = np.asarray(F_half,     dtype=float)   # (K, K)
+            d_s  = np.asarray(delta_std,  dtype=float)   # (n,)
+
+            # Factor portfolio exposures: z = F_half @ X_risk^T w,  shape (K,)
+            z = F_h @ (X_r.T @ w)
+            # Risk quadratic: ||z||² + ||delta_std ⊙ w||²
+            risk_quad = cp.sum_squares(z) + cp.sum_squares(cp.multiply(d_s, w))
+
+            if self.mu_risk > 0:
+                obj_expr = obj_expr - 0.5 * self.mu_risk * risk_quad
+
+        objective = cp.Maximize(obj_expr)
 
         # Base constraints (never relaxed)
         base_constraints = [
@@ -206,6 +282,10 @@ class PortfolioOptimizer:
         if self.max_turnover is not None:
             # 0.5||w - w_prev||_1 <= max_turnover  <=>  ||w - w_prev||_1 <= 2*max_turnover
             base_constraints.append(cp.norm1(w - w_prev) <= 2 * self.max_turnover)
+
+        if risk_active and self.max_variance is not None and risk_quad is not None:
+            # w^T Σ w <= 2 * max_variance
+            base_constraints.append(risk_quad <= 2 * self.max_variance)
 
         # Try progressively relaxed industry tolerances
         tol_values = np.round(

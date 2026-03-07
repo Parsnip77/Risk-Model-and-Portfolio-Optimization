@@ -11,9 +11,9 @@
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | 1 | 数据处理和特征工程 | 已完成 |
-| 2 | 机器学习预测 | 进行中 |
-| 3 | 风险模型构建 | 待开始 |
-| 4 | 组合优化与回测 | 待开始 |
+| 2 | 机器学习预测 | 已完成 |
+| 3 | 多因子风险模型构建 | 已完成 |
+| 4 | 组合优化与回测 | 已完成 |
 
 ---
 
@@ -28,7 +28,10 @@
 │   ├── factors_raw.parquet                  # 原始因子值（保留 NaN）
 │   ├── factors_clean.parquet               # 清洗后因子值（百分位排名，不可交易为 NaN）
 │   ├── ml_alpha.parquet                     # 第二阶段输出的合成 alpha 信号（ml_analyze_main.py 生成）
-│   └── index.parquet                        # CSI 300 指数每日收盘价（data_preparation_main.py 生成）
+│   ├── index.parquet                        # CSI 300 指数每日收盘价（data_preparation_main.py 生成）
+│   ├── risk_exposure.parquet               # 第三阶段：每日因子暴露矩阵 X_t（risk_model_main.py 生成）
+│   ├── risk_cov_F.parquet                  # 第三阶段：Cholesky 因子 L_t^T（F_t = L L^T）
+│   └── risk_delta.parquet                  # 第三阶段：个股特异性标准差 sqrt(Δ_{ii})
 ├── plots/                                   # 图表输出目录
 ├── src/
 │   ├── data_preparation/                    # 第一阶段
@@ -43,7 +46,11 @@
 │   │   ├── ml_data_prep.py                  # WalkForwardSplitter：滚动/扩展窗口 CV
 │   │   ├── lgbm_model.py                    # AlphaLGBM：LightGBM 训练/预测/SHAP
 │   │   └── ml_analyze_main.py              # 第二阶段总脚本
-│   ├── risk_model/                          # 第三阶段（待开发）
+│   ├── risk_model/                          # 第三阶段
+│   │   ├── __init__.py
+│   │   ├── risk_factor_engine.py            # RiskFactorEngine：计算 5 风格因子 + 行业哑变量
+│   │   ├── cov_estimator.py                 # CovarianceEstimator：WLS 回归 + 滚动协方差估计
+│   │   └── risk_model_main.py               # 第三阶段总脚本
 │   └── portfolio/                           # 第四阶段
 │       ├── __init__.py
 │       ├── backtester.py                    # LayeredBacktester：分层回测
@@ -293,9 +300,73 @@ SHAP beeswarm（最后一折，top-10 特征，n=300 采样）→ shap_beeswarm.
 
 ---
 
-### 第三阶段：风险模型构建
+### 第三阶段：多因子风险模型构建
 
-（待开始，预留）
+目录：`src/risk_model/`
+
+#### 总体 Pipeline 流程
+
+```
+载入 prices.parquet + meta.parquet + index.parquet
+   ↓
+RiskFactorEngine.compute()
+  ├── Size      = log(total_mv)
+  ├── Beta      = 60 日滚动 CAPM beta（对 CSI 300 OLS）
+  ├── Momentum  = close_{t-21} / close_{t-252} - 1（跳过近 1 月避免反转）
+  ├── Volatility= std(20 日日收益率)
+  ├── Value     = EP = 1/PE（PE<=0 置 NaN）
+  └── Industry  = 申万一级行业哑变量（one-hot）
+  ↓ （各风格因子截面 winsorize ±3σ + z-score 标准化）
+→ 输出 data/risk_exposure.parquet
+   ↓
+CovarianceEstimator.compute()
+  Step 1: 每日 WLS 截面回归（权重 = sqrt(total_mv)）
+    R_t = X_t f_t + ε_t
+    → 因子收益 f_t（K 维），残差 ε_t（n_t 维）
+  Step 2: 滚动 60 日因子协方差
+    F_t = sample_cov(f_{t-59:t})，加岭正则化 + Cholesky 分解
+    → 输出 L_t^T（上三角，K×K）→ data/risk_cov_F.parquet
+  Step 3: 滚动 60 日个股残差方差
+    Δ_{ii,t} = var(ε_{i,t-59:t})，下界 = (0.5%)^2
+    历史 < 30 日时用截面中位数填充
+    → 输出 sqrt(Δ_{ii}) → data/risk_delta.parquet
+```
+
+#### 文件说明
+
+| 文件 | 类 / 函数 | 说明 |
+|------|-----------|------|
+| `risk_model/risk_factor_engine.py` | `RiskFactorEngine` | 计算 5 风格因子 + 行业哑变量，截面 z-score 标准化 |
+| `risk_model/cov_estimator.py` | `CovarianceEstimator` | WLS 截面回归、滚动 60 日 F_t Cholesky 分解、Δ_t 估计 |
+| `risk_model/risk_model_main.py` | `main()` | 第三阶段端到端脚本，输出三个 parquet 文件 |
+
+#### 输出 Parquet 文件
+
+| 文件 | 格式 | 内容 |
+|------|------|------|
+| `risk_exposure.parquet` | 长表 (trade_date, ts_code, size, beta, momentum, volatility, value, ind_*) | 每日每股因子暴露矩阵 X_t；风格因子已 z-score 标准化，行业哑变量 0/1 |
+| `risk_cov_F.parquet` | 长表 (trade_date, f_i, f_j, value) | Cholesky 因子 L_t^T 的每个元素；重建方法：pivot(f_i, f_j) → K×K 矩阵 |
+| `risk_delta.parquet` | 长表 (trade_date, ts_code, delta_std) | 个股特异性风险标准差 sqrt(Δ_{ii})，按日按股 |
+
+#### 协方差矩阵分解（高效 SOCP 形式）
+
+风险模型将全局协方差矩阵 $\Sigma = X_t F_t X_t^\top + \Delta_t$ 分解为：
+
+$$w^\top \Sigma w = \underbrace{\|F_{\text{half}} \cdot (X_t^\top w)\|^2}_{\text{因子风险}} + \underbrace{\|\delta \odot w\|^2}_{\text{特异性风险}}$$
+
+其中 $F_{\text{half}} = L_t^\top$（Cholesky 上三角因子），$\delta = \sqrt{\text{diag}(\Delta_t)}$。
+这样只需 K 维向量运算（K ≈ 33），无需实例化 N×N 矩阵，cvxpy 可将其表达为 SOCP。
+
+#### 运行方式
+
+```bash
+# 先确保已运行第一阶段（生成 prices.parquet / meta.parquet / index.parquet）
+python src/data_preparation/data_preparation_main.py
+
+# 运行第三阶段（约 6~14 分钟）
+python src/risk_model/risk_model_main.py
+# 输出: data/risk_exposure.parquet, data/risk_cov_F.parquet, data/risk_delta.parquet
+```
 
 ---
 
@@ -385,17 +456,17 @@ summary = nb.run_backtest()
 
 | 文件 | 类 / 入口 | 说明 |
 |------|-----------|------|
-| `src/portfolio/optimizer.py` | `PortfolioOptimizer` | cvxpy LP 求解器：每日求解行业中性、带换手成本的最优权重向量 |
-| `src/portfolio/optimization_backtester.py` | `OptimizationBacktester` | 逐日调用优化器的纯多头回测，支持 forward_days 重叠组合逻辑（与 NetReturnBacktester 一致），计算净收益与绩效指标 |
+| `src/portfolio/optimizer.py` | `PortfolioOptimizer` | cvxpy LP/SOCP 求解器：每日求解行业中性、带换手成本、可选风险惩罚项与风险约束的最优权重向量 |
+| `src/portfolio/optimization_backtester.py` | `OptimizationBacktester` | 逐日调用优化器的纯多头回测，支持 forward_days 重叠组合逻辑与风险模型集成，计算净收益与绩效指标 |
 | `src/portfolio/optimization_main.py` | `main()` | 第四阶段独立入口脚本 |
 
 **重叠投资组合逻辑（forward_days > 1）**：当 `forward_days = d > 1` 时，与 `NetReturnBacktester` 采用相同逻辑：每日 optimizer 输出 `daily_w_t`，实际持仓为 `overlap_w_t = mean(daily_w_t, ..., daily_w_{t-d+1})`，即过去 d 天目标权重的滚动均值。每日仅操作约 1/d 仓位，压低换手率。收益与换手均基于 `overlap_w` 计算。`forward_days` 应与 alpha 的预测周期（如 `ml_analyze_main` 中的 `FORWARD_DAYS`）一致。默认 1 表示每日全仓换手。
 
 ##### 优化问题
 
-每个交易日 $t$ 求解如下 LP：
+每个交易日 $t$ 求解如下 LP（无风险模型）或 SOCP（有风险模型）：
 
-$$\max_{w_t}\ w_t^\top\hat\alpha_t - \lambda\cdot\tfrac{1}{2}\|w_t - w_{t-1}\|_1$$
+$$\max_{w_t}\ w_t^\top\hat\alpha_t - \lambda\cdot\tfrac{1}{2}\|w_t - w_{t-1}\|_1 - \tfrac{1}{2}\mu_{\text{risk}}\cdot w_t^\top\Sigma w_t$$
 
 其中 $\hat\alpha_t = \alpha_t - \bar\alpha_t$（截面去均值后的信号）；各符号含义：
 
@@ -405,15 +476,17 @@ $$\max_{w_t}\ w_t^\top\hat\alpha_t - \lambda\cdot\tfrac{1}{2}\|w_t - w_{t-1}\|_1
   - $\lambda = 0.05$\~$0.1$：高换手，日均换手率约 10\~20%
   - $\lambda = 0.2$\~$0.5$：适中，日均换手率约 2\~8%（推荐起始值）
   - $\lambda \ge 1.0$：持仓极稳定，信号追踪滞后
-- $X_{\text{ind}}$：行业 dummy 矩阵（$n \times K$）
+- $\mu_{\text{risk}}$（`mu_risk`）：风险惩罚系数。0 = 禁用。由于 alpha 量级 ~0.5、$w^\top\Sigma w$ 日方差量级 ~0.0001，要使两项可比需 $\mu_{\text{risk}} \approx 5000$，推荐调参范围 1000\~10000。
+- $\Sigma = X_t F_t X_t^\top + \Delta_t$：由第三阶段风险模型提供；分解为 $\|L_t^\top (X_t^\top w)\|^2 + \|\delta \odot w\|^2$ 进行 SOCP 求解
+- $X_{\text{ind}}$：行业 dummy 矩阵（$n \times K_{\text{ind}}$）
 - $w_{\text{bench}}$：基准行业权重，每日由 `meta.parquet` 中全部 CSI 300 股票的 `total_mv` 加权计算
-- $\delta = 0.01$：行业偏离容差（不可行时自动逐步放宽至 ±5%）
+- $\delta_{\text{ind}} = 0.01$：行业偏离容差（不可行时自动逐步放宽至 ±5%）
 
-约束：$\sum_i w_i = 1$，$w_i \ge 0$，$w_i \le 0.05$，$\tfrac{1}{2}\|w_t - w_{t-1}\|_1 \le \text{max\_turnover}$（默认 10%），$|X_{\text{ind}}^\top w_t - w_{\text{bench}}| \le \delta$。`max_turnover=None` 时禁用换手约束。
+约束：$\sum_i w_i = 1$，$w_i \ge 0$，$w_i \le 0.05$，$\tfrac{1}{2}\|w_t - w_{t-1}\|_1 \le \text{max\_turnover}$（默认 10%），$|X_{\text{ind}}^\top w_t - w_{\text{bench}}| \le \delta_{\text{ind}}$，以及可选的日方差约束 $w_t^\top \Sigma w_t \le 2 \cdot \text{max\_variance}$。
 
 **净收益计算**（独立于优化器）：$r_t^{\text{net}} = r_t^{\text{gross}} - \text{turnover}_t \times c_{\text{real}}$，其中 $c_{\text{real}} = 0.002$（实际交易费率，仅用于 P&L 扣费，与 $\lambda$ 完全分离）。
 
-**可行性**：该问题是凸 LP（线性目标减 L1 范数 = 凹函数最大化），由 cvxpy + CLARABEL 求解，每日 <0.5 秒，全周期约 3~5 分钟。
+**求解器**：cvxpy + CLARABEL，原生支持 LP 和 SOCP，无需切换求解器。无风险模型时每日约 <0.5 秒（全周期约 3\~5 分钟）；有风险模型（SOCP）每日约 1\~2 秒（全周期约 15\~25 分钟）。
 
 ##### 关键设计决策
 
@@ -422,10 +495,11 @@ $$\max_{w_t}\ w_t^\top\hat\alpha_t - \lambda\cdot\tfrac{1}{2}\|w_t - w_{t-1}\|_1
 3. **截面 alpha 去均值**：进入优化器前每日截面减均值，保证信号对称分布在 0 附近，`lambda_turnover` 量级具有跨时间的一致性。
 4. **换手率硬约束**：$\tfrac{1}{2}\|w - w_{\text{prev}}\|_1 \le \text{max\_turnover}$（默认 10%）。`max_turnover=None` 时禁用。
 5. **行业约束动态基准**：基准权重每日更新（不使用静态值），反映 CSI 300 真实行业构成变化。
-6. **不可行日自动处理**：$\delta$ 依次扩大（0.01 → 0.02 → ... → 0.05），所有容差均失败时去掉行业约束求解，报告中记录发生次数。
+6. **不可行日自动处理**：$\delta_{\text{ind}}$ 依次扩大（0.01 → 0.02 → ... → 0.05），所有容差均失败时去掉行业约束求解，报告中记录发生次数。
 7. **首日初始化**：$w_0 = \mathbf{0}$（空仓），第一个有效日完整买入，换手率≈100% 计入成本。
 8. **重叠组合（forward_days > 1）**：与 `NetReturnBacktester` 一致，`overlap_w = rolling_mean(daily_w, d)`，前 d 行 trim 掉。`optimization_main` 中 `FORWARD_DAYS=3` 与 `ml_analyze_main` 保持一致。
-9. **基准超额收益分析**：`NetReturnBacktester` 和 `OptimizationBacktester` 均支持可选的 `benchmark_prices` 参数（CSI 300 每日收盘价 Series）。传入后会：
+9. **风险模型集成（Stage 3 → Stage 4）**：`optimization_main.py` 中设置 `USE_RISK_MODEL=True` 即可启用。`OptimizationBacktester` 自动加载三个风险模型 parquet 文件，每日提取 $(X_t, L_t^\top, \delta_t)$ 传入 `PortfolioOptimizer.solve()`。优化器用 `cp.sum_squares` 实现 SOCP 风险项，无需构造 N×N 矩阵。回测报告额外输出 `Avg Daily Variance` 和 `Avg Daily Std (%)` 用于 `mu_risk` 标定。前置条件：已运行 `risk_model_main.py`。
+10. **基准超额收益分析**：`NetReturnBacktester` 和 `OptimizationBacktester` 均支持可选的 `benchmark_prices` 参数（CSI 300 每日收盘价 Series）。传入后会：
    - 计算超额日收益 `excess_ret = strategy_ret - bench_ret`；
    - 在 `run_backtest()` 报告中追加五项指标：`Bench Ann Return`、`Excess Ann Return`、`Tracking Error`、`Information Ratio`、`Max Relative DD`；
    - 将图表改为**双面板**：上栏绝对净值（策略蓝色 + 沪深300橙色）、下栏超额净值（绿色，基准为 1.0 水平线）并标注 IR / Tracking Error。
@@ -438,7 +512,10 @@ $$\max_{w_t}\ w_t^\top\hat\alpha_t - \lambda\cdot\tfrac{1}{2}\|w_t - w_{t-1}\|_1
 # 先确保已运行 ml_analyze_main.py（生成 data/ml_alpha.parquet）
 python src/LightGBM/ml_analyze_main.py
 
-# 再运行优化回测
+# 可选：运行第三阶段风险模型（约 6~14 分钟，生成三个 risk_*.parquet）
+python src/risk_model/risk_model_main.py
+
+# 再运行优化回测（如已运行风险模型，可在 optimization_main.py 中设置 USE_RISK_MODEL=True）
 python src/portfolio/optimization_main.py
 # 输出: result_optimization.txt, plots/optimization_nav.png
 ```
@@ -469,8 +546,14 @@ python src/data_preparation/data_preparation_main.py
 # 5. 运行第二阶段总脚本（LightGBM 训练 + IC + 回测 + SHAP + 保存 ml_alpha.parquet）
 python src/LightGBM/ml_analyze_main.py
 
-# 6. 运行第四阶段总脚本（凸优化组合回测）
+# 6. 运行第三阶段总脚本（多因子风险模型，约 6~14 分钟）
+python src/risk_model/risk_model_main.py
+# 输出: data/risk_exposure.parquet, data/risk_cov_F.parquet, data/risk_delta.parquet
+
+# 7. 运行第四阶段总脚本（凸优化组合回测）
+#    在 optimization_main.py 中配置 USE_RISK_MODEL / MU_RISK / MAX_VARIANCE
 python src/portfolio/optimization_main.py
+# 输出: result_optimization.txt, plots/optimization_nav.png
 ```
 
 ---

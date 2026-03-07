@@ -166,6 +166,20 @@ class OptimizationBacktester:
         portfolio is traded each day to reduce turnover.  Must match
         the alpha's prediction horizon (e.g. FORWARD_DAYS in ml_analyze_main).
         Default 1 = no overlapping (daily full rebalance).
+    use_risk_model : bool
+        If True, load risk model Parquet files (data/risk_exposure.parquet,
+        data/risk_cov_F.parquet, data/risk_delta.parquet) and pass factor
+        exposures / Cholesky factors / idiosyncratic stds to the optimiser.
+        Requires running src/risk_model/risk_model_main.py first.
+        Default False.
+    mu_risk : float
+        Risk-aversion coefficient for the quadratic risk penalty in the
+        optimiser objective: -0.5 * mu_risk * w^T Σ w.
+        0.0 disables the penalty.  Typical range: 1000–10000.
+        Only used when use_risk_model=True.
+    max_variance : float or None
+        Hard daily variance constraint: w^T Σ w <= 2 * max_variance.
+        None disables this constraint.  Only used when use_risk_model=True.
     plots_dir : path-like, optional
         Directory to save the NAV chart.  None disables file output.
     """
@@ -184,6 +198,9 @@ class OptimizationBacktester:
         industry_tol: float = 0.01,
         max_turnover: Optional[float] = 0.10,
         forward_days: int = 1,
+        use_risk_model: bool = False,
+        mu_risk: float = 0.0,
+        max_variance: Optional[float] = None,
         plots_dir: Optional[pathlib.Path | str] = None,
         benchmark_prices: Optional[pd.Series] = None,
     ) -> None:
@@ -194,15 +211,18 @@ class OptimizationBacktester:
             raise ValueError(
                 f"alpha_df must have exactly one alpha column; got {alpha_cols}"
             )
-        self.alpha_col = alpha_cols[0]
-        self.cost_rate = cost_rate           # monetary rate for P&L accounting
-        self.lambda_turnover = lambda_turnover  # optimiser penalty coefficient
-        self.rf = rf
-        self.max_weight = max_weight
-        self.industry_tol = industry_tol
-        self.max_turnover = max_turnover
-        self.forward_days = max(1, int(forward_days))
-        self.plots_dir = pathlib.Path(plots_dir) if plots_dir is not None else None
+        self.alpha_col       = alpha_cols[0]
+        self.cost_rate       = cost_rate           # monetary rate for P&L accounting
+        self.lambda_turnover = lambda_turnover     # optimiser penalty coefficient
+        self.rf              = rf
+        self.max_weight      = max_weight
+        self.industry_tol    = industry_tol
+        self.max_turnover    = max_turnover
+        self.forward_days    = max(1, int(forward_days))
+        self.use_risk_model  = use_risk_model
+        self.mu_risk         = mu_risk
+        self.max_variance    = max_variance
+        self.plots_dir       = pathlib.Path(plots_dir) if plots_dir is not None else None
 
         # Benchmark (optional): CSI 300 close-price Series (index=trade_date)
         # Returns are computed internally via pct_change() to keep the caller simple.
@@ -212,12 +232,122 @@ class OptimizationBacktester:
         self._prices_df = prices_df
         self._meta_df   = meta_df
 
+        # Risk model data (loaded lazily when use_risk_model=True)
+        self._risk_exposure_by_date: Optional[dict] = None   # date → (ts_code → factor row)
+        self._risk_F_half_by_date: Optional[dict]   = None   # date → np.ndarray (K, K)
+        self._risk_delta_by_date: Optional[dict]    = None   # date → pd.Series (ts_code → delta_std)
+
+        if use_risk_model:
+            self._load_risk_model()
+
         # Cached results
-        self._net_ret: Optional[pd.Series]   = None
-        self._gross_ret: Optional[pd.Series] = None
-        self._turnover: Optional[pd.Series]  = None
-        self._summary: Optional[pd.Series]   = None
-        self._relax_log: list[dict]           = []   # records of tolerance relaxation
+        self._net_ret: Optional[pd.Series]    = None
+        self._gross_ret: Optional[pd.Series]  = None
+        self._turnover: Optional[pd.Series]   = None
+        self._variance: Optional[pd.Series]   = None   # daily realised w^T Σ w
+        self._summary: Optional[pd.Series]    = None
+        self._relax_log: list[dict]            = []    # records of tolerance relaxation
+
+    # ------------------------------------------------------------------
+    # Risk model loading
+    # ------------------------------------------------------------------
+
+    def _load_risk_model(self) -> None:
+        """Load pre-computed risk model parquet files and index by trade_date.
+
+        Expected files (produced by risk_model_main.py):
+            data/risk_exposure.parquet  — [trade_date, ts_code, <factor_cols>]
+            data/risk_cov_F.parquet     — [trade_date, f_i, f_j, value]
+            data/risk_delta.parquet     — [trade_date, ts_code, delta_std]
+
+        Raises FileNotFoundError if any required file is missing.
+        """
+        import pathlib as _pl
+
+        # Locate data directory relative to this file: src/portfolio/ → project root / data
+        _data_dir = _pl.Path(__file__).parent.parent.parent / "data"
+
+        paths = {
+            "risk_exposure": _data_dir / "risk_exposure.parquet",
+            "risk_cov_F":    _data_dir / "risk_cov_F.parquet",
+            "risk_delta":    _data_dir / "risk_delta.parquet",
+        }
+        for name, path in paths.items():
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Risk model file not found: {path}\n"
+                    "Run src/risk_model/risk_model_main.py first."
+                )
+
+        print("  Loading risk model data ...")
+
+        # --- Exposure: dict {date: DataFrame(index=ts_code, cols=factor_cols)} ---
+        exposure_df = pd.read_parquet(paths["risk_exposure"])
+        exposure_df["trade_date"] = pd.to_datetime(exposure_df["trade_date"])
+        factor_cols = [c for c in exposure_df.columns if c not in {"trade_date", "ts_code"}]
+        self._risk_factor_cols = factor_cols
+        self._risk_exposure_by_date = {
+            date: grp.set_index("ts_code")[factor_cols]
+            for date, grp in exposure_df.groupby("trade_date")
+        }
+
+        # --- F_half: dict {date: np.ndarray (K, K)} ---
+        f_half_df = pd.read_parquet(paths["risk_cov_F"])
+        f_half_df["trade_date"] = pd.to_datetime(f_half_df["trade_date"])
+        K = len(factor_cols)
+        self._risk_F_half_by_date = {}
+        for date, grp in f_half_df.groupby("trade_date"):
+            pivot = grp.pivot(index="f_i", columns="f_j", values="value")
+            # Reindex to ensure consistent column/row ordering
+            pivot = pivot.reindex(index=factor_cols, columns=factor_cols, fill_value=0.0)
+            self._risk_F_half_by_date[date] = pivot.values.astype(float)
+
+        # --- Delta: dict {date: pd.Series(index=ts_code, values=delta_std)} ---
+        delta_df = pd.read_parquet(paths["risk_delta"])
+        delta_df["trade_date"] = pd.to_datetime(delta_df["trade_date"])
+        self._risk_delta_by_date = {
+            date: grp.set_index("ts_code")["delta_std"]
+            for date, grp in delta_df.groupby("trade_date")
+        }
+
+        n_dates = len(self._risk_exposure_by_date)
+        print(f"  Risk model loaded: {n_dates} dates, K={K} factors.")
+
+    def _get_risk_inputs(
+        self,
+        date: pd.Timestamp,
+        stocks: list,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """Extract risk model inputs for a given date and stock universe.
+
+        Returns (X_risk, F_half, delta_std) or (None, None, None) if any
+        component is unavailable for this date.
+        """
+        if not self.use_risk_model:
+            return None, None, None
+
+        # Normalise date to match dict keys (risk model uses pd.to_datetime)
+        date_norm = pd.to_datetime(date)
+        exp_day   = self._risk_exposure_by_date.get(date_norm)
+        f_half_t  = self._risk_F_half_by_date.get(date_norm)
+        delta_day = self._risk_delta_by_date.get(date_norm)
+
+        if exp_day is None or f_half_t is None or delta_day is None:
+            return None, None, None
+
+        # Align to the current tradable universe (stocks)
+        X_sub     = exp_day.reindex(stocks).fillna(0.0)
+        delta_sub = delta_day.reindex(stocks)
+
+        # If any stock still lacks a delta_std, fill with cross-sectional median
+        med = float(delta_day.median()) if not delta_day.empty else 1e-3
+        delta_sub = delta_sub.fillna(med)
+
+        return (
+            X_sub.values.astype(float),
+            f_half_t,
+            delta_sub.values.astype(float),
+        )
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -374,12 +504,15 @@ class OptimizationBacktester:
             max_weight=self.max_weight,
             industry_tol=self.industry_tol,
             max_turnover=self.max_turnover,
+            mu_risk=self.mu_risk,
+            max_variance=self.max_variance,
         )
 
-        gross_ret_list: list[float] = []
-        turnover_list:  list[float] = []
-        net_ret_list:   list[float] = []
-        date_index:     list        = []
+        gross_ret_list:  list[float] = []
+        turnover_list:   list[float] = []
+        net_ret_list:    list[float] = []
+        variance_list:   list[float] = []   # daily realised w^T Σ w
+        date_index:      list        = []
 
         self._relax_log = []
 
@@ -411,11 +544,17 @@ class OptimizationBacktester:
                     S_t, meta_today, has_mv
                 )
 
-                # Solve the LP
+                # Optional risk model inputs
+                X_risk_t, F_half_t, delta_std_t = self._get_risk_inputs(date, S_t)
+
+                # Solve the LP/SOCP
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     w_star, tol_used = optimiser.solve(
-                        alpha_t, w_prev, X_ind, w_bench
+                        alpha_t, w_prev, X_ind, w_bench,
+                        X_risk=X_risk_t,
+                        F_half=F_half_t,
+                        delta_std=delta_std_t,
                     )
                     for w in caught:
                         self._relax_log.append({
@@ -432,10 +571,19 @@ class OptimizationBacktester:
                         "date": date,
                         "message": f"industry tol relaxed to {tol_used:.2%}",
                     })
+
+                # Compute realised variance w^T Σ w for reporting
+                day_var = float("nan")
+                if X_risk_t is not None and F_half_t is not None and delta_std_t is not None:
+                    w_arr = w_star.astype(float)
+                    z     = F_half_t @ (X_risk_t.T @ w_arr)
+                    day_var = float(np.dot(z, z) + np.dot(delta_std_t * w_arr, delta_std_t * w_arr))
+                variance_list.append(day_var)
             else:
                 # Too few tradable stocks: hold current position (no trade)
                 w_new = overlap_w_prev.copy()
                 w_new[~overlap_w_prev.index.isin(S_t)] = 0.0
+                variance_list.append(float("nan"))
 
             # Overlapping portfolio: overlap_w = rolling mean of daily optimizer
             # outputs.  When forward_days > 1, only 1/d of portfolio trades daily.
@@ -460,6 +608,7 @@ class OptimizationBacktester:
         trim = self.forward_days
         self._gross_ret = pd.Series(gross_ret_list[trim:], index=date_index[trim:])
         self._turnover  = pd.Series(turnover_list[trim:],  index=date_index[trim:])
+        self._variance  = pd.Series(variance_list[trim:],  index=date_index[trim:])
         self._net_ret   = pd.Series(net_ret_list[trim:],   index=date_index[trim:])
 
     def _build_industry_inputs(
@@ -563,6 +712,12 @@ class OptimizationBacktester:
         metrics["Relaxation Events"]   = sum(
             1 for e in self._relax_log if "relaxed" in e.get("message", "")
         )
+
+        # Risk model diagnostics (only meaningful when use_risk_model=True)
+        if self._variance is not None and self._variance.notna().any():
+            avg_var = float(self._variance.mean(skipna=True))
+            metrics["Avg Daily Variance"] = avg_var
+            metrics["Avg Daily Std (%)"]  = float(np.sqrt(avg_var) * 100)
 
         if self._benchmark_prices is not None:
             metrics.update(self._calc_excess_metrics(self._net_ret))

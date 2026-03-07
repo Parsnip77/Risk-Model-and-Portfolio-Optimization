@@ -13,6 +13,7 @@
   Optimisation Settings
 ======================================================================
 Objective  : max  w' alpha_centered - lambda_TO/2 * ||w - w_prev||_1
+                  - 1/2 * mu_risk * w^T Σ w  (if USE_RISK_MODEL)
              (alpha_centered = alpha - cross_sectional_mean(alpha))
 
 lambda_turnover : 0.0
@@ -27,7 +28,10 @@ Max weight per stock : 5%
 Max turnover         : 20%
 Industry neutrality  : ±10% tolerance (auto-relax up to ±5%)
 Forward days (d)     : 1  (overlapping portfolio when > 1)
-Solver               : CLARABEL (cvxpy default for LP)
+Risk model           : ON
+mu_risk              : 0.0  (risk-aversion coefficient; 0 = disabled)
+max_variance         : 8e-05
+Solver               : CLARABEL (cvxpy default for LP/SOCP)
 
 ======================================================================
   Running Optimisation Backtest ...
@@ -38,19 +42,21 @@ Solver               : CLARABEL (cvxpy default for LP)
   Performance Summary
 ======================================================================
 
-Cum Return           -0.181468
-Ann Return           -0.070325
-Ann Vol               0.212581
-Sharpe               -0.471939
-Max DD               -0.366468
-Avg Daily Turnover    0.200926
-Breakeven Turnover   -0.002469
+Cum Return           -0.215525
+Ann Return           -0.084603
+Ann Vol               0.193354
+Sharpe               -0.592707
+Max DD               -0.376864
+Avg Daily Turnover    0.206808
+Breakeven Turnover   -0.027766
 Relaxation Events     0.000000
+Avg Daily Variance    0.000117
+Avg Daily Std (%)     1.079818
 Bench Ann Return     -0.115043
-Excess Ann Return     0.055600
-Tracking Error        0.158928
-Information Ratio     0.349843
-Max Relative DD      -0.095513
+Excess Ann Return     0.036216
+Tracking Error        0.145786
+Information Ratio     0.248419
+Max Relative DD      -0.112019
 
 ======================================================================
   Industry Tolerance Relaxation Log

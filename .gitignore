@@ -1,9 +1,6 @@
 # Local-only docs (never push to remote; project docs for remote will be written later)
 prompt.md
-temporary.md
-Instruction_old.md
-debug_data.py
-debug_data.txt
+Instruction.md
 
 .cursor/
 

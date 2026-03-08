@@ -14,11 +14,11 @@
 
 **第三阶段：风险模型构建层 + 风格因子计算**
 
-第三阶段基于第一阶段导出的行情与基本面数据构建多因子风险模型。计算 5 个风格因子（Size、Beta、Momentum、Volatility、Value）与申万一级行业哑变量，截面 winsorize ±3σ 后 z-score 标准化；对每日进行 WLS 截面回归得到因子收益与残差，滚动 60 日估计因子协方差矩阵 F_t 与个股特异性方差 Δ\_ii。最终将因子暴露矩阵、Cholesky 因子 L_t^T、个股特异性标准差 sqrt(Δ\_ii) 导出为三个 Parquet 文件，供第四阶段协方差矩阵分解为 SOCP 形式使用。总脚本由 `risk_model_main.py` 执行，输出 `risk_exposure.parquet`、`risk_cov_F.parquet`、`risk_delta.parquet`。
+第三阶段基于第一阶段导出的行情与基本面数据构建多因子风险模型。计算 5 个风格因子（Size、Beta、Momentum、Volatility、Value）与申万一级行业哑变量，截面 winsorize ±3σ 后 z-score 标准化；对每日进行 WLS 截面回归得到因子收益与残差，滚动 60 日估计因子协方差矩阵 $F_t$ 与个股特异性方差 $Δ_{ii}$。最终将因子暴露矩阵、Cholesky 因子 $L_t^\top$、个股特异性标准差 $\sqrt{Δ_{ii}}$ 导出为三个 Parquet 文件，供第四阶段协方差矩阵分解为 SOCP 形式使用。总脚本由 `risk_model_main.py` 执行，输出 `risk_exposure.parquet`、`risk_cov_F.parquet`、`risk_delta.parquet`。
 
 **第四阶段：投资组合优化层 + 净收益回测**
 
-第四阶段基于第二阶段生成的 ML Alpha 信号，采用 cvxpy 求解每日行业中性、带换手成本与可选风险惩罚的凸优化问题（LP 或 SOCP），实现投资组合最优化。当 `USE_RISK_MODEL=True` 时，自动加载第三阶段输出的风险模型文件，将协方差矩阵分解为 $\|L_t^\top (X_t^\top w)\|^2 + \|\delta \dot w\|^2$ 形式进行高效 SOCP 求解。净收益按毛收益减去 2‰ 交易费率与换手率乘积计算，输出净值曲线图和相关回测指标、指数跟踪超额指标。总脚本由 `optimization_main.py` 执行，报告写入 `result_optimization.txt`，净值图导出至 `plots/optimization_nav.png`。
+第四阶段基于第二阶段生成的 ML Alpha 信号，采用 cvxpy 求解每日行业中性、带换手成本与可选风险惩罚的凸优化问题（LP 或 SOCP），实现投资组合最优化。当 `USE_RISK_MODEL=True` 时，自动加载第三阶段输出的风险模型文件，将协方差矩阵分解为 $\|L_t^\top (X_t^\top w)\|^2 + \|\delta \cdot w\|^2$ 形式进行高效 SOCP 求解。净收益按毛收益减去 2‰ 交易费率与换手率乘积计算，输出净值曲线图和相关回测指标、指数跟踪超额指标。总脚本由 `optimization_main.py` 执行，报告写入 `result_optimization.txt`，净值图导出至 `plots/optimization_nav.png`。
 
 ---
 

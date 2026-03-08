@@ -84,9 +84,9 @@ FactorCleaner.process_all()
 | `factor_downside_vol`          | $\text{std}(R_t[R_t < 0],\ 20)$                              | 下行波动率（仅负收益日），20 日              |
 | `factor_upside_vol`            | $\text{std}(R_t[R_t > 0],\ 20)$                              | 上行波动率（仅正收益日），20 日              |
 | `factor_gap_return`            | $(O_t - C_{t-1}) / C_{t-1}$                                  | 隔夜收益（开盘相对前收）                     |
-| `factor_turnover_volatility`   | $\text{std}(\text{turnover\_rate},\ 20)$                     | 换手率 20 日滚动标准差                       |
+| `factor_turnover_volatility`   | $\text{std}(\text{turnover}\_  \text{rate},\ 20)$            | 换手率 20 日滚动标准差                       |
 | `factor_distance_from_low`     | $(C - \text{tsmin}(C, 60)) / \text{tsmin}(C, 60)$            | 距 60 日最低点的涨幅，恒 ≥ 0                 |
-| `factor_momentum_acceleration` | $\text{mom}_{5d} - \text{mom}_{10d}$                         | 动量加速度（短期减中期）                     |
+| `factor_momentum_acceleration` | $\text{mom}_ {5d} - \text{mom}_ {10d}$                       | 动量加速度（短期减中期）                     |
 | `factor_return_consistency`    | 20 日内正收益日占比                                          | 收益一致性，值域 [0, 1]                      |
 
 **B 组 — 基本面与估值因子**（季度数据 PIT 对齐或日频，共 7 个）
@@ -96,47 +96,47 @@ FactorCleaner.process_all()
 | `factor_ep`            | $1/\text{PE}$            | 盈利收益率                                  |
 | `factor_bp`            | $1/\text{PB}$            | 账面市值比                                  |
 | `factor_roe`           | 加权平均 ROE             | 来自 `fina_indicator`，按 ann_date PIT 对齐 |
-| `factor_log_mv`        | $\log(\text{total\_mv})$ | 对数市值，规模因子                          |
-| `factor_ps`            | $1/\text{ps\_ttm}$       | 市销率倒数（daily_basic）                   |
+| `factor_log_mv`        | $\log(\text{total}\_ \text{mv})$ | 对数市值，规模因子                          |
+| `factor_ps`            | $1/\text{ps ttm}$       | 市销率倒数（daily_basic）                   |
 | `factor_dv_ratio`      | dv_ratio                 | 股息率（daily_basic）                       |
 | `factor_circ_mv_ratio` | circ_mv / total_mv       | 流通市值占比                                |
 
 **C 组 — 截面相对特征**（共 12 个）
 
-| 因子                            | 公式                                                     | 说明                                      |
-| ------------------------------- | -------------------------------------------------------- | ----------------------------------------- |
-| `factor_industry_rel_turnover`  | 换手率 − 行业截面**中位数**                              | 相对行业换手率偏离（差值）                |
-| `factor_industry_rel_bp`        | BP − 行业截面**中位数**                                  | 相对行业估值偏离（差值）                  |
-| `factor_industry_rel_mv`        | $\log(\text{mv}) - \text{行业中位数}(\log(\text{mv}))$   | 相对行业市值偏离（差值）                  |
-| `factor_industry_rel_ep`        | EP − 行业截面**中位数**                                  | 相对行业盈利收益率偏离（差值）            |
-| `factor_industry_rel_roe`       | ROE − 行业截面**中位数**                                 | 相对行业 ROE 偏离（差值）                 |
-| `factor_ts_rel_turnover`        | 换手率 / 60 日滚动**均值**                               | 时序相对换手率（比值）                    |
-| `factor_ind_rel_momentum_5d`    | $\text{mom}_{5d} - \text{行业中位数}(\text{mom}_{5d})$   | 行业相对 5 日动量（差值）                 |
-| `factor_ind_rel_momentum_10d`   | $\text{mom}_{10d} - \text{行业中位数}(\text{mom}_{10d})$ | 行业相对 10 日动量（差值）                |
-| `factor_ind_rel_momentum_20d`   | $\text{mom}_{20d} - \text{行业中位数}(\text{mom}_{20d})$ | 行业相对 20 日动量（差值）                |
-| `factor_ind_rel_turnover_ratio` | 换手率 / 行业截面**均值**                                | 行业相对换手率（比值，尺度不变）          |
-| `factor_ind_rel_vol`            | $\text{rvol}_{20d} /\text{ 行业均值}(\text{rvol}_{20d})$ | 行业相对已实现波动率（比值，以 1 为中心） |
+| 因子                            | 公式                                                       | 说明                                      |
+| ------------------------------- | ---------------------------------------------------------- | ----------------------------------------- |
+| `factor_industry_rel_turnover`  | 换手率 − 行业截面**中位数**                                | 相对行业换手率偏离（差值）                |
+| `factor_industry_rel_bp`        | BP − 行业截面**中位数**                                    | 相对行业估值偏离（差值）                  |
+| `factor_industry_rel_mv`        | $\log(\text{mv}) - \text{行业中位数}(\log(\text{mv}))$     | 相对行业市值偏离（差值）                  |
+| `factor_industry_rel_ep`        | EP − 行业截面**中位数**                                    | 相对行业盈利收益率偏离（差值）            |
+| `factor_industry_rel_roe`       | ROE − 行业截面**中位数**                                   | 相对行业 ROE 偏离（差值）                 |
+| `factor_ts_rel_turnover`        | 换手率 / 60 日滚动**均值**                                 | 时序相对换手率（比值）                    |
+| `factor_ind_rel_momentum_5d`    | $\text{mom}_ {5d} - \text{行业中位数}(\text{mom}_ {5d})$   | 行业相对 5 日动量（差值）                 |
+| `factor_ind_rel_momentum_10d`   | $\text{mom}_ {10d} - \text{行业中位数}(\text{mom}_ {10d})$ | 行业相对 10 日动量（差值）                |
+| `factor_ind_rel_momentum_20d`   | $\text{mom}_ {20d} - \text{行业中位数}(\text{mom}_ {20d})$ | 行业相对 20 日动量（差值）                |
+| `factor_ind_rel_turnover_ratio` | 换手率 / 行业截面**均值**                                  | 行业相对换手率（比值，尺度不变）          |
+| `factor_ind_rel_vol`            | $\text{rvol}_ {20d} /\text{ 行业均值}(\text{rvol}_ {20d})$ | 行业相对已实现波动率（比值，以 1 为中心） |
 
 **15 alpha 因子 — 来自 WorldQuant Alpha101**
 
 
-| 因子                   | 公式                                                         | <span style="display:inline-block;width:300px">说明</span> |
-| ---------------------- | ------------------------------------------------------------ | ---------------------------------------------------------- |
-| `alpha001`             | `rank(ts_argmax(signedpower((ret<0)?stddev(ret,20):close, 2), 5)) - 0.5` | 负收益时用波动率替代收盘价，对5日最高值的时序位置排名      |
-| `alpha003`             | `-1 * correlation(rank(open), rank(volume), 10)`             | 开盘价排名与成交量排名的滚动相关性取反                     |
-| `alpha006`             | `-1 * correlation(open, volume, 10)`                         | 开盘价与成交量的滚动相关性取反                             |
-| `alpha012`             | `sign(delta(volume, 1)) * (-1 * delta(close, 1))`            | 成交量方向乘以收盘价变动反向                               |
-| `alpha038`             | `(-1 * rank(ts_rank(close, 10))) * rank(close/open)`         | 近期高位且高涨幅的股票做空                                 |
-| `alpha040`             | `(-1 * rank(stddev(high, 10))) * correlation(high, volume, 10)` | 高价波动率乘以高价-成交量相关性                            |
-| `alpha041`             | `sqrt(high * low) - vwap`                                    | 高低价几何均值与成交均价之差（精确 vwap）                  |
-| `alpha042`             | `rank(vwap - close) / rank(vwap + close)`                    | 收盘价相对 vwap 的位置比率（delay-0 均值回归）             |
-| `alpha054`             | `(-1 * (low-close) * open^5) / ((low-high) * close^5)`       | 基于开/收/高/低价五次幂的日内动量                          |
-| `alpha072`             | `rank(decay_linear(corr((H+L)/2, adv40, 8), 10)) / rank(decay_linear(corr(ts_rank(vwap,3), ts_rank(vol,18), 6), 2))` | 中价-量相关性与 vwap-量 ts_rank 相关性之比                 |
-| `alpha088`             | `min(rank(decay_linear((rank(O)+rank(L))-(rank(H)+rank(C)),8)), ts_rank(decay_linear(corr(ts_rank(C,8),ts_rank(adv60,20),8),6),2))` | 价格结构排名差与成交量相关性的最小值                       |
-| `alpha094`             | `signedpower(rank(vwap - ts_min(vwap,11)), ts_rank(corr(ts_rank(vwap,19), ts_rank(adv60,4), 18), 2)) * -1` | vwap 距历史低点的幂次排名因子                              |
-| `alpha098`             | `rank(decay_linear(corr(vwap,sum(adv5,26),4),7)) - rank(decay_linear(ts_rank(ts_argmin(corr(rank(O),rank(adv15),20),8),6),8))` | vwap-量相关性与开盘价-量相关性低点时序排名之差             |
-| `alpha101`             | `(close - open) / (high - low + 0.001)`                      | 日内动量：价格区间归一化的涨跌幅                           |
-| `alpha_5_day_reversal` | `(close - delay(close, 5)) / delay(close, 5)`                | 5日收盘价的反转因子                                        |
+| <span style="display:inline-block;width:70px">因子</span> | <span style="display:inline-block;width:300px">公式</span>   | <span style="display:inline-block;width:300px">说明</span> |
+| --------------------------------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------------- |
+| `alpha001`                                                | `rank(ts_argmax(signedpower((ret<0)?stddev(ret,20):close, 2), 5)) - 0.5` | 负收益时用波动率替代收盘价，对5日最高值的时序位置排名      |
+| `alpha003`                                                | `-1 * correlation(rank(open), rank(volume), 10)`             | 开盘价排名与成交量排名的滚动相关性取反                     |
+| `alpha006`                                                | `-1 * correlation(open, volume, 10)`                         | 开盘价与成交量的滚动相关性取反                             |
+| `alpha012`                                                | `sign(delta(volume, 1)) * (-1 * delta(close, 1))`            | 成交量方向乘以收盘价变动反向                               |
+| `alpha038`                                                | `(-1 * rank(ts_rank(close, 10))) * rank(close/open)`         | 近期高位且高涨幅的股票做空                                 |
+| `alpha040`                                                | `(-1 * rank(stddev(high, 10))) * correlation(high, volume, 10)` | 高价波动率乘以高价-成交量相关性                            |
+| `alpha041`                                                | `sqrt(high * low) - vwap`                                    | 高低价几何均值与成交均价之差（精确 vwap）                  |
+| `alpha042`                                                | `rank(vwap - close) / rank(vwap + close)`                    | 收盘价相对 vwap 的位置比率（delay-0 均值回归）             |
+| `alpha054`                                                | `(-1 * (low-close) * open^5) / ((low-high) * close^5)`       | 基于开/收/高/低价五次幂的日内动量                          |
+| `alpha072`                                                | `rank(decay_linear(corr((H+L)/2, adv40, 8), 10)) / rank(decay_linear(corr(ts_rank(vwap,3), ts_rank(vol,18), 6), 2))` | 中价-量相关性与 vwap-量 ts_rank 相关性之比                 |
+| `alpha088`                                                | `min(rank(decay_linear((rank(O)+rank(L))-(rank(H)+rank(C)),8)), ts_rank(decay_linear(corr(ts_rank(C,8),ts_rank(adv60,20),8),6),2))` | 价格结构排名差与成交量相关性的最小值                       |
+| `alpha094`                                                | `signedpower(rank(vwap - ts_min(vwap,11)), ts_rank(corr(ts_rank(vwap,19), ts_rank(adv60,4), 18), 2)) * -1` | vwap 距历史低点的幂次排名因子                              |
+| `alpha098`                                                | `rank(decay_linear(corr(vwap,sum(adv5,26),4),7)) - rank(decay_linear(ts_rank(ts_argmin(corr(rank(O),rank(adv15),20),8),6),8))` | vwap-量相关性与开盘价-量相关性低点时序排名之差             |
+| `alpha101`                                                | `(close - open) / (high - low + 0.001)`                      | 日内动量：价格区间归一化的涨跌幅                           |
+| `alpha_5_day_reversal`                                    | `(close - delay(close, 5)) / delay(close, 5)`                | 5日收盘价的反转因子                                        |
 
 #### 输出 Parquet 文件
 
@@ -305,7 +305,8 @@ CovarianceEstimator.compute()
 $$
 w^\top \Sigma w = \underbrace{\|F_{\text{half}} \cdot (X_t^\top w)\|^2}_{\text{因子风险}} + \underbrace{\|\delta \odot w\|^2}_{\text{特异性风险}}
 $$
-其中 $F_{\text{half}} = L_t^\top$（Cholesky 上三角因子），$\delta = \sqrt{\text{diag}(\Delta_t)}$。
+
+其中 $F_{\text{half}} = L_t^\top$（Cholesky 上三角因子），$\delta = \sqrt{\text{diag}(\Delta_ t)}$。
 这样只需 K 维向量运算（K ≈ 33），无需实例化 N×N 矩阵，cvxpy 可将其表达为 SOCP。
 
 #### 运行方式
@@ -421,7 +422,6 @@ $$
 \max_{w_t}\ w_t^\top\hat\alpha_t - \lambda\cdot\tfrac{1}{2}\|w_t - w_{t-1}\|_1 - \tfrac{1}{2}\mu_{\text{risk}}\cdot w_t^\top\Sigma w_t
 $$
 各符号含义：
-
 - $\hat\alpha_t$：截面去均值后的 ML alpha 信号，范围约 $[-0.5,\,0.5]$。**去均值不改变截面排序**，仅将信号中心化为 0，使 $\lambda$ 的调参量级稳定。
 - $w_{t-1}$：前一日持仓权重（新股赋 0，退市股强制清仓）
 - $\lambda$（`lambda_turnover`）：换手惩罚系数，**无量纲的策略偏好参数**，非交易费率。根据报告中的 `Avg Daily Turnover` 手动调整：

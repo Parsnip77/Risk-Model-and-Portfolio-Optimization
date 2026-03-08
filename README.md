@@ -96,7 +96,7 @@
 
 ## 三、各阶段 Pipeline 
 
-详见 [PIPELNE.md](./PIPELINE.md)。
+详见 [PIPELNE.md](./PIPELINE.md)，其中含有较多数学公式，Github 预览可能不能正常显示，请下载到本地查看。
 
 ----
 

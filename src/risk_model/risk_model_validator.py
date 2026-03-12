@@ -276,6 +276,15 @@ class RiskModelValidator:
         if len(common) < 2:
             return
 
+        # Convert index to datetime for correct matplotlib date axis
+        # (trade_date may be int YYYYMMDD from parquet; raw int would show as 1970)
+        if pd.api.types.is_datetime64_any_dtype(common):
+            common_dt = common
+        else:
+            common_dt = pd.to_datetime(common.astype(str), format="%Y%m%d", errors="coerce")
+            if common_dt.isna().any():
+                common_dt = pd.to_datetime(common)
+
         # Side-by-side layout: (a) time series left (wider), (b) scatter right
         fig, axes = plt.subplots(1, 2, figsize=(12, 5), gridspec_kw={"width_ratios": [2, 1]})
         fig.patch.set_facecolor("white")
@@ -292,7 +301,7 @@ class RiskModelValidator:
         # Left: time series (volatility = sqrt(variance) for readability)
         ax0 = axes[0]
         ax0.plot(
-            common,
+            common_dt,
             np.sqrt(pred.values) * 100,
             label="Predicted vol (%)",
             color="#1565C0",
@@ -300,7 +309,7 @@ class RiskModelValidator:
             alpha=0.9,
         )
         ax0.plot(
-            common,
+            common_dt,
             np.sqrt(real.values) * 100,
             label="Realized vol (%)",
             color="#E65100",

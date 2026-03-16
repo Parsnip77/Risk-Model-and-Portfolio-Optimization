@@ -18,7 +18,7 @@
 
 **第四阶段：投资组合优化层 + 净收益回测**
 
-第四阶段基于第二阶段生成的 ML Alpha 信号，采用 cvxpy 求解每日行业中性、带换手成本与可选风险惩罚的凸优化问题（LP 或 SOCP），实现投资组合最优化。当 `USE_RISK_MODEL=True` 时，自动加载第三阶段输出的风险模型文件，将协方差矩阵分解为 $\|L_t^\top (X_t^\top w)\|^2 + \|\delta \cdot w\|^2$ 形式进行高效 SOCP 求解。净收益按毛收益减去 2‰ 交易费率与换手率乘积计算，输出净值曲线图和相关回测指标、指数跟踪超额指标。总脚本由 `optimization_main.py` 执行，报告写入 `result_optimization.txt`，净值图导出至 `plots/optimization_nav.png`。
+第四阶段基于第二阶段生成的 ML Alpha 信号，采用 cvxpy 求解每日行业中性、带换手成本与可选风险惩罚的凸优化问题（LP 或 SOCP），实现投资组合最优化。当 `USE_RISK_MODEL=True` 时，自动加载第三阶段输出的风险模型文件，将协方差矩阵分解为 $\|L_t^\top (X_t^\top w)\|^2 + \|\delta \odot w\|^2$ 形式进行高效 SOCP 求解。净收益按毛收益减去 2‰ 交易费率与换手率乘积计算，输出净值曲线图和相关回测指标、指数跟踪超额指标。总脚本由 `optimization_main.py` 执行，报告写入 `result_optimization.txt`，净值图导出至 `plots/optimization_nav.png`。
 
 ---
 

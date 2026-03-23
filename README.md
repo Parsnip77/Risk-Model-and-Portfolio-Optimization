@@ -60,6 +60,7 @@
 │   ├── risk_cov_F.parquet                   # Cholesky 因子 L_t^T（F_t = L L^T）
 │   └── risk_delta.parquet                   # 个股特异性标准差 sqrt(Δ_{ii})
 ├── plots/                                   # 图表输出目录
+├── Modeling/                                # 建模过程说明文档
 ├── src/
 │   ├── data_preparation/                    # 第一阶段
 │   │   ├── __init__.py
@@ -104,7 +105,7 @@
 
 详见 [PIPELINE.md](./PIPELINE.md)，其中含有较多数学公式，Github 预览可能不能正常显示，请下载到本地查看。
 
-----
+---
 
 ## 四、各文件使用说明
 
@@ -112,7 +113,13 @@
 
 ---
 
-## 五、推荐使用流程
+## 五、模型建模过程
+
+详见 [MODEL.pdf](./Modeling/MODEL.pdf)
+
+---
+
+## 六、推荐使用流程
 
 ```bash
 # 1. 安装依赖（含 cvxpy）

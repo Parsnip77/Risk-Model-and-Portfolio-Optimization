@@ -1,0 +1,659 @@
+% !TEX program = xelatex
+\documentclass[12pt, a4paper, oneside]{article} 
+\usepackage[UTF8]{ctex}
+\usepackage{graphicx, geometry, amsmath, amssymb, extarrows}
+
+\geometry{left = 25mm, right = 25mm, top = 20mm, bottom = 20mm}
+
+% \documentclass[12pt,a4paper,fontset=none]{ctexart}
+
+% \usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage{booktabs,longtable,array,tabularx,multirow}
+\usepackage{enumitem}
+\usepackage{setspace}
+\usepackage{hyperref}
+\usepackage{xurl}
+\usepackage{caption}
+\usepackage{float}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    citecolor=black,
+    urlcolor=blue
+}
+
+%\setstretch{1.15}
+%\setlength{\parindent}{2em}
+%\setlength{\LTleft}{0pt}
+%\setlength{\LTright}{0pt}
+\renewcommand{\arraystretch}{1.15}
+\urlstyle{tt}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\Std}{\operatorname{Std}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\code}[1]{{\small\nolinkurl{#1}}}
+
+%\setmainfont{Times New Roman}
+%\setsansfont{Arial}
+%\setmonofont{Menlo}
+%\setCJKmainfont{STSong}
+%\setCJKsansfont{Heiti SC}
+%\setCJKmonofont{Heiti SC}
+
+\title{\textbf{基于机器学习收益预测与多因子风险约束的股票组合优化模型}}
+\author{}
+\date{}
+
+\begin{document}
+
+% \maketitle
+
+% \begin{abstract}
+% 本文针对沪深 300 股票池上的短周期选股与组合管理问题，构建了一套由特征工程、机器学习收益预测、多因子风险建模和约束组合优化组成的统一框架。首先，在前复权价格、日频基本面和点时财务数据的基础上构造 66 维候选特征，并通过可交易性筛选、行业中位数填补和横截面百分位排名得到模型输入。其次，以开盘到开盘前瞻收益为基础构造行业中性训练标签，采用 LightGBM 在 Walk-Forward 时序切分下学习非线性收益映射，得到日频合成 Alpha。再次，以收盘到收盘收益为对象，构造由 5 个风格因子和行业哑变量组成的线性风险模型，利用市值加权横截面回归估计因子收益，并在滚动窗口内估计因子协方差与特异性风险，进而得到可分解的日度协方差结构。最后，在满仓、纯多头、换手、行业偏离和可选风格中性约束下，求解含换手惩罚和风险惩罚的凸优化问题，并结合重叠持仓机制完成净收益回测。该模型将收益预测、风险控制和交易约束纳入同一数学框架，为短周期量化选股策略提供了结构清晰且可计算的实现方案。
+% \end{abstract}
+
+% \noindent\textbf{关键词：}机器学习收益预测；多因子风险模型；协方差分解；凸优化；组合管理
+
+\section{问题描述与符号约定}
+
+研究对象为沪深 300 股票池上的日频选股与组合管理问题。模型由四个层次构成：特征工程、收益预测、风险建模与组合优化。前两层刻画股票在下一持有期内的相对收益优势，后两层刻画给定收益信号下的风险暴露与权重配置。
+
+设 \(t\) 为交易日，\(\mathcal U_t\) 为时点 \(t\) 的可交易股票集合，\(N_t = |\mathcal U_t|\) 为当日可交易股票数量。对任意股票 \(i \in \mathcal U_t\)，记
+\[
+O_{i,t},\ H_{i,t},\ L_{i,t},\ C_{i,t}
+\]
+分别为开盘价、最高价、最低价与收盘价，\(V_{i,t}\) 为成交量，\(\phi_{i,t} \in \mathbb R^p\) 为收益预测特征向量，\(x_{i,t} \in \mathbb R^K\) 为风险因子暴露向量，\(w_t \in \mathbb R^{N_t}\) 为组合权重向量。
+
+收益预测与回测使用开盘到开盘收益，风险建模使用收盘到收盘收益。前者服务于交易决策，后者服务于协方差估计，二者对应不同层次的问题。
+
+\section{交易时序与收益定义}
+
+交易时序采用严格的无前视偏差设定：在 \(t\) 日收盘后计算特征与信号，在 \(t+1\) 日开盘建仓，在 \(t+d+1\) 日开盘平仓或滚动换仓。因此，持有期为 \(d\) 的前瞻收益定义为
+\begin{equation}
+r_{i,t}^{(d)} = \frac{O_{i,t+d+1}}{O_{i,t+1}} - 1.
+\end{equation}
+
+项目默认 \(d=1\)，故收益预测标签与回测收益均以
+\begin{equation}
+r_{i,t} = \frac{O_{i,t+2}}{O_{i,t+1}} - 1
+\end{equation}
+为基本口径。该定义与组合回测中真实实现的开盘到开盘持有收益完全一致。
+
+\section{特征工程}
+
+\subsection{数据来源与点时对齐}
+
+基础数据包括股票日线行情、日频基本面、复权因子、ST 区间、CSI 300 指数行情以及季度财务数据。价量因子统一基于前复权价格计算。若 \(A_{i,t}\) 为复权因子，\(T_i\) 为样本末端日期，则前复权价格定义为
+\begin{equation}
+P_{i,t}^{\mathrm{fwd}} = P_{i,t}^{\mathrm{raw}} \cdot \frac{A_{i,t}}{A_{i,T_i}}.
+\end{equation}
+
+季度财务数据采用 Point-in-Time 对齐。若财务变量 \(q\) 的公告日为 \(\tau\)，则交易日 \(t\) 上可使用的值定义为
+\begin{equation}
+q_{i,t} = q_{i,\tau^\star}, \qquad \tau^\star = \max\{\tau : \tau \le t\}.
+\end{equation}
+这保证了财务因子不包含未来信息。
+
+\subsection{可交易性筛选}
+
+仅有可交易样本进入建模。定义可交易掩码 \(m_{i,t} \in \{0,1\}\)，若股票在 \(t\) 日满足停牌、退市或价格异常、涨跌停、ST/*ST 或上市未满 180 天中的任一情形，则记为不可交易。形式上可写为
+\begin{equation}
+m_{i,t} = \mathbf 1\{\text{股票 } i \text{ 在 } t \text{ 日可交易}\}.
+\end{equation}
+
+清洗后的特征在所有 \(m_{i,t}=0\) 的位置上统一置为缺失，从而在模型训练和组合回测中自动排除。
+
+\subsection{因子库结构}
+
+当前实现共使用 66 个候选特征，其中 52 个以 \texttt{factor\_*} 形式输出，14 个以 \texttt{alpha*} 形式输出。主文只保留结构性概览，完整定义见附录 A。各组规模见表 \ref{tab:factor-groups}。
+
+\begin{table}[H]
+\centering
+\caption{候选因子库的分组结构}
+\label{tab:factor-groups}
+\begin{tabular}{lll}
+\toprule
+组别 & 数量 & 主要内容 \\
+\midrule
+A 组 & 33 & 微观结构与量价因子 \\
+B 组 & 7  & 基本面与估值因子 \\
+C 组 & 12 & 截面相对与补充特征 \\
+Alpha 子集 & 14 & Alpha101 价格--成交量因子 \\
+\midrule
+合计 & 66 & 机器学习收益预测输入特征 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{缺失值处理与横截面标准化}
+
+对任意原始因子 \(x_{i,t}^{(j)}\)，模型采用如下预处理流程：
+\begin{enumerate}[label=\arabic*)]
+    \item 将 \(\pm\infty\) 替换为缺失值；
+    \item 用行业横截面中位数填补缺失，若行业中位数仍缺失，则退回到全市场横截面中位数；
+    \item 在每个交易日对因子值做横截面百分位排名。
+\end{enumerate}
+
+记填补后的值为 \(\tilde x_{i,t}^{(j)}\)，则最终进入机器学习模型的特征定义为
+\begin{equation}
+z_{i,t}^{(j)} = \operatorname{PctRank}_t\!\left(\tilde x_{i,t}^{(j)}\right) \in (0,1].
+\end{equation}
+
+上述处理同时解决了缺失值、量纲不一致与极端值敏感性问题，并将输入特征统一为可比较的横截面相对位置。
+
+\section{机器学习收益预测模型}
+
+\subsection{收益预测目标}
+
+收益预测的目标是在高维特征 \(\phi_{i,t}\) 与未来收益排序之间建立非线性映射。记合成 Alpha 为 \(\alpha_{i,t}\)，则模型形式为
+\begin{equation}
+\alpha_{i,t} = f_\theta(\phi_{i,t}),
+\end{equation}
+其中 \(f_\theta\) 由 LightGBM 回归器表示。相较于传统横截面线性收益回归，该结构允许模型自动学习特征间的非线性交互与阈值效应。
+
+\subsection{行业中性训练标签}
+
+若直接使用原始未来收益作为标签，则行业轮动会混入模型学习目标。为突出行业内部的相对选股能力，先对原始前瞻收益 \(r_{i,t}\) 做行业中性化。记 \(g(i,t)\) 为股票 \(i\) 在 \(t\) 日所属行业，\(\mathcal G_{g,t}\) 为该行业股票集合，则行业中性收益定义为
+\begin{equation}
+\tilde r_{i,t} = r_{i,t} - \frac{1}{|\mathcal G_{g(i,t),t}|}\sum_{k\in\mathcal G_{g(i,t),t}} r_{k,t}.
+\end{equation}
+
+对 \(\tilde r_{i,t}\) 在每个交易日做横截面百分位排名，得到训练标签
+\begin{equation}
+y_{i,t} = \operatorname{PctRank}_t(\tilde r_{i,t}) \in (0,1].
+\end{equation}
+
+这样，模型学习的是行业内部的收益排序结构，而评价与回测仍使用原始收益 \(r_{i,t}\)，从而保持策略表现解释的真实性。
+
+\subsection{Walk-Forward 时序切分}
+
+训练集、验证集与测试集采用严格的时间顺序切分。设训练窗口长度为 \(T_{\mathrm{tr}}\)，验证窗口长度为 \(T_{\mathrm{val}}\)，测试窗口长度为 \(T_{\mathrm{te}}\)，并在验证与测试之间加入 embargo 间隔 \(T_{\mathrm{emb}}\)。默认配置为 15 个月训练、3 个月验证、3 个月测试和 1 个交易日 embargo。每一折均满足
+\begin{equation}
+\mathrm{Train} \rightarrow \mathrm{Validation} \rightarrow \mathrm{Embargo} \rightarrow \mathrm{Test}.
+\end{equation}
+
+该切分方式可以避免时序泄漏，并允许模型在验证集上进行 early stopping。
+
+\subsection{LightGBM 学习问题}
+
+机器学习收益预测的训练问题可写为
+\begin{equation}
+\hat y_{i,t} = f_\theta(\phi_{i,t}), \qquad \theta^\star = \arg\min_\theta \sum_{(i,t)\in\mathcal D} \ell\!\left(y_{i,t}, f_\theta(\phi_{i,t})\right).
+\end{equation}
+
+实现中使用浅树、样本子采样、特征子采样和 early stopping，以抑制金融数据低信噪比环境下的过拟合。
+
+\subsection{Alpha 平滑与评价指标}
+
+各折测试集预测值拼接后，对每只股票的 Alpha 做可选的时间序列平滑。若启用指数加权移动平均，则平滑信号满足
+\begin{equation}
+\alpha_{i,t}^{\mathrm{EMA}} = \beta \alpha_{i,t} + (1-\beta)\alpha_{i,t-1}^{\mathrm{EMA}}.
+\end{equation}
+若启用滚动均值，则先计算
+\begin{equation}
+\alpha_{i,t}^{\mathrm{MA}} = \frac{1}{h}\sum_{s=0}^{h-1}\alpha_{i,t-s}.
+\end{equation}
+
+模型有效性首先通过截面秩相关检验。定义日频信息系数
+\begin{equation}
+\mathrm{IC}_t = \operatorname{corr}_{\mathrm{Spearman}}(\alpha_{\cdot,t}, r_{\cdot,t}),
+\end{equation}
+则平均 IC 与 ICIR 分别为
+\begin{equation}
+\overline{\mathrm{IC}} = \frac{1}{T}\sum_{t=1}^{T}\mathrm{IC}_t, \qquad \mathrm{ICIR} = \frac{\overline{\mathrm{IC}}}{\Std(\mathrm{IC}_t)}.
+\end{equation}
+
+除 IC 之外，模型还通过行业中性分层回测与纯多头净收益回测评估信号的单调性、可交易性和扣费后表现。
+
+\section{多因子风险模型}
+
+\subsection{线性风险分解结构}
+
+风险模型以日度收盘到收盘收益为对象，假设个股收益可以分解为公共因子驱动部分与特异性部分，即
+\begin{equation}
+r_t^{\mathrm{risk}} = X_t f_t + \varepsilon_t.
+\end{equation}
+
+其中 \(r_t^{\mathrm{risk}} \in \mathbb R^{N_t}\) 为 close-to-close 收益向量，\(X_t \in \mathbb R^{N_t\times K}\) 为因子暴露矩阵，\(f_t \in \mathbb R^K\) 为因子收益，\(\varepsilon_t \in \mathbb R^{N_t}\) 为特异性收益。
+
+\subsection{风险因子暴露}
+
+当前实现中，风险暴露由 5 个风格因子与若干申万一级行业哑变量构成：
+\begin{equation}
+x_{i,t} = [\mathrm{size}_{i,t}, \mathrm{beta}_{i,t}, \mathrm{momentum}_{i,t}, \mathrm{volatility}_{i,t}, \mathrm{value}_{i,t}, d_{i,t,1}, \dots, d_{i,t,J}]^\top.
+\end{equation}
+
+五个风格因子的定义如下：
+\begin{align}
+\mathrm{size}_{i,t} &= \log(\mathrm{MV}_{i,t}), \\
+r_{i,s}^{\mathrm{cc}} &= a_{i,t} + \beta_{i,t}r_{m,s}^{\mathrm{cc}} + u_{i,s}, \qquad s=t-59,\dots,t, \\
+\mathrm{momentum}_{i,t} &= \frac{C_{i,t-21}}{C_{i,t-252}} - 1, \\
+\mathrm{volatility}_{i,t} &= \Std(r_{i,s}^{\mathrm{cc}}: s=t-19,\dots,t), \\
+\mathrm{value}_{i,t} &= \frac{1}{\mathrm{PE}_{i,t}}, \qquad \mathrm{PE}_{i,t}\le 0 \Rightarrow \mathrm{value}_{i,t}=\mathrm{NaN}.
+\end{align}
+
+\subsection{暴露标准化}
+
+风格因子先做横截面 \(\pm 3\sigma\) 截尾，再做 z-score 标准化。若原始暴露为 \(x_{i,t,k}\)，则截尾值与标准化值分别定义为
+\begin{equation}
+x_{i,t,k}^{\mathrm{clip}} = \min\{\max(x_{i,t,k}, \mu_{t,k} - 3\sigma_{t,k}), \mu_{t,k} + 3\sigma_{t,k}\},
+\end{equation}
+\begin{equation}
+z_{i,t,k} = \frac{x_{i,t,k}^{\mathrm{clip}} - \bar x_{t,k}^{\mathrm{clip}}}{s_{t,k}^{\mathrm{clip}}}.
+\end{equation}
+行业因子保持 0/1 哑变量形式，最终拼接为暴露矩阵 \(X_t\)。
+
+\subsection{因子收益的截面加权回归}
+
+在每个交易日 \(t\)，模型在可交易股票集合 \(\mathcal U_t\) 上估计截面回归
+\begin{equation}
+r_t^{\mathrm{risk}} = X_t f_t + \varepsilon_t.
+\end{equation}
+
+采用市值加权最小二乘估计：
+\begin{equation}
+\hat f_t = \arg\min_f \sum_{i\in\mathcal U_t}\mathrm{MV}_{i,t}\big(r_{i,t}^{\mathrm{risk}} - x_{i,t}^\top f\big)^2.
+\end{equation}
+
+数值实现上等价于对样本行乘以 \(\sqrt{\mathrm{MV}_{i,t}}\) 后再做最小二乘求解。该步骤输出因子收益序列 \(\{\hat f_t\}\) 与特异性残差序列 \(\{\hat\varepsilon_{i,t}\}\)。
+
+\subsection{因子协方差与特异性风险}
+
+设滚动窗口长度为 \(H=60\) 个交易日，则因子协方差矩阵定义为
+\begin{equation}
+F_t = \Cov(\hat f_{t-H+1},\dots,\hat f_t) + \lambda I,
+\end{equation}
+其中 \(\lambda>0\) 为 ridge 正则项。进一步作 Cholesky 分解
+\begin{equation}
+F_t = L_tL_t^\top.
+\end{equation}
+
+项目将特异性风险建模为对角矩阵
+\begin{equation}
+\Delta_t = \diag(\Delta_{11,t},\dots,\Delta_{N_tN_t,t}),
+\end{equation}
+其中单只股票的特异性方差由滚动残差方差估计：
+\begin{equation}
+\Delta_{ii,t} = \max\{\Var(\hat\varepsilon_{i,t-59:t}), \delta_{\min}^2\}.
+\end{equation}
+若某股票可用样本不足，则以当日横截面中位数回填。最终保存的是特异性标准差
+\begin{equation}
+\delta_{i,t} = \sqrt{\Delta_{ii,t}}.
+\end{equation}
+
+\subsection{协方差矩阵的风险分解}
+
+由因子结构可得任意交易日 \(t\) 的股票协方差矩阵
+\begin{equation}
+\Sigma_t = X_tF_tX_t^\top + \Delta_t.
+\end{equation}
+
+对任意权重向量 \(w_t\)，组合方差为
+\begin{equation}
+w_t^\top\Sigma_tw_t = w_t^\top X_tF_tX_t^\top w_t + w_t^\top \Delta_t w_t.
+\end{equation}
+利用 \(F_t = L_tL_t^\top\)，上式可改写为
+\begin{equation}
+w_t^\top\Sigma_tw_t = \|L_t^\top(X_t^\top w_t)\|_2^2 + \|\delta_t \odot w_t\|_2^2.
+\end{equation}
+
+这一分解避免了显式构造 \(N_t\times N_t\) 协方差矩阵，并使风险项能够直接写成二范数平方之和，为后续 SOCP 优化提供了结构基础。
+
+\subsection{风险模型验证}
+
+以可交易股票形成的市值加权组合作为检验对象，其权重定义为
+\begin{equation}
+w_{i,t}^{\mathrm{bench}} = \frac{\mathrm{MV}_{i,t}}{\sum_{k\in\mathcal U_t}\mathrm{MV}_{k,t}}.
+\end{equation}
+
+预测方差为
+\begin{equation}
+\hat v_t = (w_t^{\mathrm{bench}})^\top\Sigma_t w_t^{\mathrm{bench}},
+\end{equation}
+已实现方差由滚动样本方差给出
+\begin{equation}
+v_t^{\mathrm{real}} = \Var(r_{p,t-h+1},\dots,r_{p,t}), \qquad h=60.
+\end{equation}
+
+项目使用的验证指标包括
+\begin{equation}
+\begin{aligned}
+\mathrm{Bias\ Ratio} &= \frac{\E[\hat v_t]}{\E[v_t^{\mathrm{real}}]}, \\
+\mathrm{RMSE}_{\mathrm{var}} &= \sqrt{\E[(\hat v_t - v_t^{\mathrm{real}})^2]}, \\
+\mathrm{RMSE}_{\mathrm{vol}} &= \sqrt{\E[(\sqrt{\hat v_t} - \sqrt{v_t^{\mathrm{real}}})^2]}.
+\end{aligned}
+\end{equation}
+此外还计算 Pearson 相关、Spearman 相关与 \(R^2\) 以评价风险模型的解释能力与校准程度。
+
+\section{组合优化模型}
+
+\subsection{Alpha 去均值}
+
+进入优化器前，先对当日 Alpha 做横截面去均值：
+\begin{equation}
+\alpha_{i,t}^{c} = \alpha_{i,t} - \frac{1}{N_t}\sum_{k\in\mathcal U_t}\alpha_{k,t}.
+\end{equation}
+该变换不改变股票排序，但会将信号中心稳定在 0 附近，从而提高换手惩罚参数与风险惩罚参数的可比性。
+
+\subsection{单期优化目标}
+
+对每个交易日 \(t\)，求解如下凸优化问题：
+\begin{equation}
+\max_{w_t}\ \alpha_t^{c\top}w_t - \frac{\lambda_{\mathrm{TO}}}{2}\|w_t - w_{t-1}\|_1 - \frac{\mu_{\mathrm{risk}}}{2}w_t^\top\Sigma_t w_t.
+\end{equation}
+
+其中 \(\lambda_{\mathrm{TO}}\) 为换手惩罚系数，\(\mu_{\mathrm{risk}}\) 为风险厌恶系数。若不启用风险模型，则 \(\mu_{\mathrm{risk}}=0\)，问题退化为线性规划；若启用风险模型，则可借助前述协方差分解将问题表示为二阶锥优化问题。
+
+\subsection{组合约束}
+
+优化问题满足以下约束。
+
+\paragraph{(1) 满仓与纯多头约束}
+\begin{equation}
+\mathbf 1^\top w_t = 1, \qquad w_t \ge 0.
+\end{equation}
+
+\paragraph{(2) 单股权重上限}
+\begin{equation}
+w_{i,t} \le w_{\max}.
+\end{equation}
+
+\paragraph{(3) 换手率硬约束}
+定义单边换手率
+\begin{equation}
+\mathrm{TO}_t = \frac{1}{2}\|w_t - w_{t-1}\|_1,
+\end{equation}
+则约束为
+\begin{equation}
+\frac{1}{2}\|w_t - w_{t-1}\|_1 \le \tau_{\max}.
+\end{equation}
+
+\paragraph{(4) 行业偏离约束}
+记 \(X_t^{\mathrm{ind}}\) 为股票--行业哑变量矩阵，\(w_t^{\mathrm{bench,ind}}\) 为基准行业权重，则要求
+\begin{equation}
+\big|(X_t^{\mathrm{ind}})^\top w_t - w_t^{\mathrm{bench,ind}}\big| \le \delta_{\mathrm{ind}}.
+\end{equation}
+行业基准权重按全部基准股票的市值权重计算，而不是在当日可交易子集内重新归一化。若约束不可行，则逐步放宽 \(\delta_{\mathrm{ind}}\) 直到求解成功或达到预设上限。
+
+\paragraph{(5) 方差上限约束}
+若启用风险上限，则要求
+\begin{equation}
+w_t^\top\Sigma_t w_t \le \bar\sigma_t^2.
+\end{equation}
+
+\paragraph{(6) 风格中性约束}
+若启用风格中性，设股票级基准权重为 \(w_t^{\mathrm{bench,stock}}\)，主动权重为
+\begin{equation}
+w_t^{\mathrm{active}} = w_t - w_t^{\mathrm{bench,stock}}.
+\end{equation}
+对每个风格因子 \(k\)，约束写为
+\begin{equation}
+\big|(w_t^{\mathrm{active}})^\top x_{t,k}^{\mathrm{style}}\big| \le \tau_{\mathrm{style}}.
+\end{equation}
+
+\subsection{重叠持仓机制}
+
+若预测持有期 \(d>1\)，则项目采用重叠持仓机制。设优化器在每个交易日输出目标权重 \(w_t^\star\)，则实际持仓定义为
+\begin{equation}
+\bar w_t = \frac{1}{d}\sum_{s=0}^{d-1}w_{t-s}^\star.
+\end{equation}
+该机制使得每日仅调整约 \(1/d\) 的仓位，从而降低换手并使持有期与收益预测周期保持一致。
+
+\subsection{回测收益与交易成本}
+
+定义股票的开盘到开盘收益为
+\begin{equation}
+r_{i,t}^{\mathrm{oo}} = \frac{O_{i,t+1}}{O_{i,t}} - 1.
+\end{equation}
+
+则组合毛收益为
+\begin{equation}
+r_{p,t}^{\mathrm{gross}} = \bar w_{t-1}^\top r_t^{\mathrm{oo}}.
+\end{equation}
+单边换手率为
+\begin{equation}
+\mathrm{TO}_t = \frac{1}{2}\|\bar w_t - \bar w_{t-1}\|_1.
+\end{equation}
+净收益为
+\begin{equation}
+r_{p,t}^{\mathrm{net}} = r_{p,t}^{\mathrm{gross}} - c\cdot \mathrm{TO}_t, \qquad c = 0.002.
+\end{equation}
+
+\subsection{回测绩效指标}
+
+设回测样本长度为 \(n\)，年交易日数记为 \(D=252\)，年化无风险利率记为 \(r_f\)（项目默认 \(r_f=0.03\)）。由净收益序列 \(\{r_{p,t}^{\mathrm{net}}\}_{t=1}^n\) 构造净值序列
+\begin{equation}
+\mathrm{NAV}_t = \prod_{u=1}^{t}(1+r_{p,u}^{\mathrm{net}}), \qquad \mathrm{NAV}_0 = 1.
+\end{equation}
+
+据此，累计收益定义为
+\begin{equation}
+R_{\mathrm{cum}} = \mathrm{NAV}_n - 1.
+\end{equation}
+
+年化收益采用复利折算：
+\begin{equation}
+R_{\mathrm{ann}} = (1 + R_{\mathrm{cum}})^{D/n} - 1.
+\end{equation}
+
+年化波动率定义为日频净收益样本标准差的年化值：
+\begin{equation}
+\sigma_{\mathrm{ann}} = \Std(r_{p,t}^{\mathrm{net}})\sqrt{D}.
+\end{equation}
+
+Sharpe 比率定义为
+\begin{equation}
+\mathrm{Sharpe} = \frac{R_{\mathrm{ann}} - r_f}{\sigma_{\mathrm{ann}}}.
+\end{equation}
+
+最大回撤由净值路径的历史峰值回撤给出：
+\begin{equation}
+\mathrm{MDD} = \min_{1\le t\le n}\left(\frac{\mathrm{NAV}_t}{\max_{1\le s\le t}\mathrm{NAV}_s} - 1\right).
+\end{equation}
+
+除收益风险指标外，项目还报告平均单边日换手率：
+\begin{equation}
+\overline{\mathrm{TO}} = \frac{1}{n}\sum_{t=1}^{n}\mathrm{TO}_t.
+\end{equation}
+
+为刻画交易成本的可承受上界，进一步定义盈亏平衡换手率。记毛收益序列对应的年化收益为 \(R_{\mathrm{ann}}^{\mathrm{gross}}\)，则在成本率 \(c\) 下，
+\begin{equation}
+\mathrm{TO}_{\mathrm{breakeven}} = \frac{R_{\mathrm{ann}}^{\mathrm{gross}} - r_f}{cD}.
+\end{equation}
+该指标表示在其他条件不变时，策略仍能覆盖无风险收益所允许的平均日换手上限。
+
+若提供基准指数价格序列，则进一步计算超额收益指标。项目实现中使用 CSI 300 指数的收盘到收盘收益作为基准收益，记为
+\begin{equation}
+r_{b,t} = \frac{P_{b,t}}{P_{b,t-1}} - 1.
+\end{equation}
+尽管组合收益采用开盘到开盘口径，二者在日内存在轻微时点错位，但对年度层面的超额绩效评价影响有限。
+
+基准累计收益与年化收益分别定义为
+\begin{equation}
+R_{b,\mathrm{cum}} = \prod_{t=1}^{n}(1+r_{b,t}) - 1, \qquad R_{b,\mathrm{ann}} = (1 + R_{b,\mathrm{cum}})^{D/n} - 1.
+\end{equation}
+
+定义日超额收益
+\begin{equation}
+e_t = r_{p,t}^{\mathrm{net}} - r_{b,t},
+\end{equation}
+其样本均值与样本标准差分别记为
+\begin{equation}
+\bar e = \frac{1}{n}\sum_{t=1}^{n}e_t, \qquad s_e = \sqrt{\frac{1}{n-1}\sum_{t=1}^{n}(e_t - \bar e)^2}.
+\end{equation}
+
+则超额年化收益、跟踪误差与信息比率定义为
+\begin{equation}
+R_{\mathrm{ann}}^{\mathrm{excess}} = D\bar e, \qquad \mathrm{TE} = s_e\sqrt{D}, \qquad \mathrm{IR} = \frac{R_{\mathrm{ann}}^{\mathrm{excess}}}{\mathrm{TE}}.
+\end{equation}
+
+此外，项目还在超额净值路径
+\begin{equation}
+\mathrm{NAV}_t^{\mathrm{excess}} = \prod_{u=1}^{t}(1+e_u)
+\end{equation}
+上计算相对最大回撤：
+\begin{equation}
+\mathrm{MDD}^{\mathrm{excess}} = \min_{1\le t\le n}\left(\frac{\mathrm{NAV}_t^{\mathrm{excess}}}{\max_{1\le s\le t}\mathrm{NAV}_s^{\mathrm{excess}}} - 1\right).
+\end{equation}
+
+上述指标共同刻画了策略在绝对收益、波动控制、交易成本约束以及相对基准表现四个维度上的综合表现。
+
+\section{模型特征与局限}
+
+本模型具有三个结构性特征。其一，收益预测与风险预测分离：前者依赖高维非线性特征映射，后者依赖低维线性风险分解。其二，训练标签经过行业中性化处理，因而模型主要学习行业内部的相对选股能力。其三，最终组合不是简单的高分股票等权组合，而是在收益、换手、行业偏离、风格偏离和协方差风险之间求得动态平衡的凸优化解。
+
+相应地，模型也依赖若干近似假设。首先，风险模型假设公共因子结构能够较好刻画个股收益的主要相关性，并且给定公共因子后残差相关性可以忽略。其次，收益预测模型与风险模型都默认历史样本中的统计规律在样本外具有一定延续性。再次，行业中性训练会弱化策略对行业轮动收益的利用。最后，模型面向的是短周期滚动交易场景，其适用性未必能直接外推到长周期基本面配置任务。
+
+\section{结论}
+
+本文构建了一套完整的日频量化选股与组合管理模型。该模型首先通过前复权价格、点时财务对齐和横截面标准化构造高质量特征；其次利用行业中性标签与 Walk-Forward 验证训练机器学习收益模型，得到合成 Alpha；然后利用风格因子、行业因子与特异性风险构造线性多因子协方差模型；最后在换手、行业和风格约束下求解带风险惩罚的凸优化问题。该框架将收益预测、风险控制和交易约束纳入统一的数学结构，为短周期股票组合管理提供了可解释、可计算且可扩展的建模基础。
+
+\appendix
+
+\section{完整因子库定义}
+
+\newgeometry{left=18mm,right=18mm,top=20mm,bottom=20mm}
+\small
+\setlength{\tabcolsep}{3pt}
+\setlength{\LTleft}{0pt}
+\setlength{\LTright}{0pt}
+
+\subsection{A 组：微观结构与量价因子}
+
+\begin{longtable}{L{0.37\textwidth} L{0.30\textwidth} L{0.27\textwidth}}
+\caption{A 组因子定义（33 个）}\label{tab:appendix-a}\\
+\toprule
+因子 & 公式 & 说明 \\
+\midrule
+\endfirsthead
+\toprule
+因子 & 公式 & 说明 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\texttt{factor\_amihud\_illiq} & $\frac{1}{20}\sum\frac{\|R_t\|}{\text{amount}_t}\times 10^6$ & Amihud 非流动性，值越大流动性越差 \\
+\texttt{factor\_ivol} & $\Std(\varepsilon_t)$，20 日滚动 OLS 残差 & 特异性波动率，对 CSI300 做回归后的残差标准差 \\
+\texttt{factor\_beta} & 20 日滚动 OLS 回归斜率 & 对 CSI300 的市场 beta，与 IVOL 同回归 \\
+\texttt{factor\_realized\_skewness} & $\mathrm{skew}(R_t,20\text{ days})$ & 日收益率 20 日偏度（bias-corrected） \\
+\texttt{factor\_vol\_price\_corr} & $\mathrm{Corr}(\mathrm{rank}(\mathrm{close}), \mathrm{rank}(\mathrm{vol}), 10)$ & 量价秩相关（Spearman），10 日 \\
+\texttt{factor\_vol\_price\_corr\_20d} & $\mathrm{Corr}(\mathrm{rank}(\mathrm{close}), \mathrm{rank}(\mathrm{vol}), 20)$ & 量价秩相关（Spearman），20 日 \\
+\texttt{factor\_vw\_return\_5d} & $\sum(R_t \cdot V_t, 5) / \sum(V_t, 5)$ & 成交量加权收益率，5 日 \\
+\texttt{factor\_vw\_return\_10d} & $\sum(R_t \cdot V_t, 10) / \sum(V_t, 10)$ & 成交量加权收益率，10 日 \\
+\texttt{factor\_vol\_oscillator} & $\mathrm{MA}(\mathrm{vol}, 5) / \mathrm{MA}(\mathrm{vol}, 20)$ & 短期与中期成交量之比 \\
+\texttt{factor\_net\_buy\_proxy\_5d} & $\mathrm{mean}\!\left(\frac{C-O}{H-L+\epsilon}\cdot V,\ 5\right)$ & 净买入代理，5 日 \\
+\texttt{factor\_net\_buy\_proxy\_10d} & $\mathrm{mean}\!\left(\frac{C-O}{H-L+\epsilon}\cdot V,\ 10\right)$ & 净买入代理，10 日 \\
+\texttt{factor\_momentum\_1d} & $(C_t - C_{t-1}) / C_{t-1}$ & 1 日价格动量 \\
+\texttt{factor\_momentum\_3d} & $(C_t - C_{t-3}) / C_{t-3}$ & 3 日价格动量 \\
+\texttt{factor\_momentum\_5d} & $(C_t - C_{t-5}) / C_{t-5}$ & 5 日价格动量 \\
+\texttt{factor\_momentum\_10d} & $(C_t - C_{t-10}) / C_{t-10}$ & 10 日价格动量 \\
+\texttt{factor\_momentum\_20d} & $(C_t - C_{t-20}) / C_{t-20}$ & 20 日价格动量 \\
+\texttt{factor\_trend\_strength} & $\mathrm{mom}_{20} / \sum(\|R_t\|, 20)$ & 趋势强度（IR 代理） \\
+\texttt{factor\_drawdown\_from\_high} & $(C - \mathrm{tsmax}(C, 60)) / \mathrm{tsmax}(C, 60)$ & 距 60 日最高点的跌幅 \\
+\texttt{factor\_bias\_5d} & $C / \mathrm{MA}(C, 5) - 1$ & 5 日均线乖离率 \\
+\texttt{factor\_bias\_10d} & $C / \mathrm{MA}(C, 10) - 1$ & 10 日均线乖离率 \\
+\texttt{factor\_bias\_20d} & $C / \mathrm{MA}(C, 20) - 1$ & 20 日均线乖离率 \\
+\texttt{factor\_rvol\_5d} & $\Std(R_t, 5)$ & 已实现波动率，5 日 \\
+\texttt{factor\_rvol\_10d} & $\Std(R_t, 10)$ & 已实现波动率，10 日 \\
+\texttt{factor\_rvol\_20d} & $\Std(R_t, 20)$ & 已实现波动率，20 日 \\
+\texttt{factor\_realized\_kurtosis} & $\mathrm{kurt}(R_t, 20)$ & 20 日已实现超额峰度 \\
+\texttt{factor\_hl\_range} & $\mathrm{mean}((H-L)/C,\ 10)$ & 日内振幅均值，10 日滚动 \\
+\texttt{factor\_downside\_vol} & $\Std(R_t[R_t<0], 20)$ & 下行波动率，20 日 \\
+\texttt{factor\_upside\_vol} & $\Std(R_t[R_t>0], 20)$ & 上行波动率，20 日 \\
+\texttt{factor\_gap\_return} & $(O_t - C_{t-1}) / C_{t-1}$ & 隔夜收益 \\
+\texttt{factor\_turnover\_volatility} & $\Std(\mathrm{turnover\_rate}, 20)$ & 换手率滚动标准差 \\
+\texttt{factor\_distance\_from\_low} & $(C - \mathrm{tsmin}(C, 60)) / \mathrm{tsmin}(C, 60)$ & 距 60 日最低点的涨幅 \\
+\texttt{factor\_momentum\_acceleration} & $\mathrm{mom}_{5d} - \mathrm{mom}_{10d}$ & 动量加速度 \\
+\texttt{factor\_return\_consistency} & 20 日内正收益日占比 & 收益一致性，值域 \([0,1]\) \\
+\end{longtable}
+
+\subsection{B 组：基本面与估值因子}
+
+\begin{longtable}{L{0.37\textwidth} L{0.30\textwidth} L{0.27\textwidth}}
+\caption{B 组因子定义（7 个）}\label{tab:appendix-b}\\
+\toprule
+因子 & 公式 & 说明 \\
+\midrule
+\endfirsthead
+\toprule
+因子 & 公式 & 说明 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\texttt{factor\_ep} & $1/\mathrm{PE}$ & 盈利收益率 \\
+\texttt{factor\_bp} & $1/\mathrm{PB}$ & 账面市值比 \\
+\texttt{factor\_roe} & 加权平均 ROE & 按公告日进行 PIT 对齐 \\
+\texttt{factor\_log\_mv} & $\log(\mathrm{total\_mv})$ & 对数市值，规模因子 \\
+\texttt{factor\_ps} & $1/\mathrm{ps\ ttm}$ & 市销率倒数 \\
+\texttt{factor\_dv\_ratio} & \(\mathrm{dv\_ratio}\) & 股息率 \\
+\texttt{factor\_circ\_mv\_ratio} & \(\mathrm{circ\_mv}/\mathrm{total\_mv}\) & 流通市值占比 \\
+\end{longtable}
+
+\subsection{C 组：截面相对与补充特征}
+
+\begin{longtable}{L{0.37\textwidth} L{0.30\textwidth} L{0.27\textwidth}}
+\caption{C 组因子定义（12 个）}\label{tab:appendix-c}\\
+\toprule
+因子 & 公式 & 说明 \\
+\midrule
+\endfirsthead
+\toprule
+因子 & 公式 & 说明 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\texttt{factor\_industry\_rel\_turnover} & 换手率 \(-\) 行业截面中位数 & 相对行业换手率偏离 \\
+\texttt{factor\_industry\_rel\_bp} & BP \(-\) 行业截面中位数 & 相对行业估值偏离 \\
+\texttt{factor\_industry\_rel\_mv} & $\log(\mathrm{mv}) - \mathrm{median}_{\mathrm{ind}}(\log(\mathrm{mv}))$ & 相对行业市值偏离 \\
+\texttt{factor\_industry\_rel\_ep} & EP \(-\) 行业截面中位数 & 相对行业盈利收益率偏离 \\
+\texttt{factor\_industry\_rel\_roe} & ROE \(-\) 行业截面中位数 & 相对行业 ROE 偏离 \\
+\texttt{factor\_ts\_rel\_turnover} & 换手率 / 60 日滚动均值 & 时序相对换手率 \\
+\texttt{factor\_ind\_rel\_momentum\_5d} & $\mathrm{mom}_{5d} - \mathrm{median}_{\mathrm{ind}}(\mathrm{mom}_{5d})$ & 行业相对 5 日动量 \\
+\texttt{factor\_ind\_rel\_momentum\_10d} & $\mathrm{mom}_{10d} - \mathrm{median}_{\mathrm{ind}}(\mathrm{mom}_{10d})$ & 行业相对 10 日动量 \\
+\texttt{factor\_ind\_rel\_momentum\_20d} & $\mathrm{mom}_{20d} - \mathrm{median}_{\mathrm{ind}}(\mathrm{mom}_{20d})$ & 行业相对 20 日动量 \\
+\texttt{factor\_ind\_rel\_turnover\_ratio} & 换手率 / 行业截面均值 & 行业相对换手率（比值） \\
+\texttt{factor\_ind\_rel\_vol} & $\mathrm{rvol}_{20d}/\mathrm{mean}_{\mathrm{ind}}(\mathrm{rvol}_{20d})$ & 行业相对已实现波动率 \\
+\texttt{factor\_5\_day\_reversal} & $(\mathrm{close}-\mathrm{delay}(\mathrm{close},5))/\mathrm{delay}(\mathrm{close},5)$ & 5 日收盘价反转因子 \\
+\end{longtable}
+
+\subsection{Alpha101 子集因子}
+
+\begin{longtable}{L{0.16\textwidth} L{0.50\textwidth} L{0.24\textwidth}}
+\caption{Alpha101 子集因子（14 个）}\label{tab:appendix-alpha}\\
+\toprule
+因子 & 公式表达 & 说明 \\
+\midrule
+\endfirsthead
+\toprule
+因子 & 公式表达 & 说明 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\code{alpha001} & \code{rank(ts_argmax(signedpower((ret<0)?stddev(ret,20):close,2),5))-0.5} & 负收益时用波动率替代收盘价，对 5 日最高值位置排名 \\
+\code{alpha003} & \code{-1*correlation(rank(open),rank(volume),10)} & 开盘价排名与成交量排名的滚动相关性取反 \\
+\code{alpha006} & \code{-1*correlation(open,volume,10)} & 开盘价与成交量的滚动相关性取反 \\
+\code{alpha012} & \code{sign(delta(volume,1))*(-1*delta(close,1))} & 成交量方向乘以收盘价变动反向 \\
+\code{alpha038} & \code{(-1*rank(ts_rank(close,10)))*rank(close/open)} & 近期高位且高涨幅的股票做空 \\
+\code{alpha040} & \code{(-1*rank(stddev(high,10)))*correlation(high,volume,10)} & 高价波动率乘以高价--成交量相关性 \\
+\code{alpha041} & \code{sqrt(high*low)-vwap} & 高低价几何均值与成交均价之差 \\
+\code{alpha042} & \code{rank(vwap-close)/rank(vwap+close)} & 收盘价相对 vwap 的位置比率 \\
+\code{alpha054} & \code{(-1*(low-close)*open^5)/((low-high)*close^5)} & 基于 OHLC 五次幂的日内动量 \\
+\code{alpha072} & \code{rank(decay_linear(corr((H+L)/2,adv40,8),10))/rank(decay_linear(corr(ts_rank(vwap,3),ts_rank(vol,18),6),2))} & 中价--量相关性与 vwap--量相关性之比 \\
+\code{alpha088} & \code{min(rank(decay_linear((rank(O)+rank(L))-(rank(H)+rank(C)),8)),ts_rank(decay_linear(corr(ts_rank(C,8),ts_rank(adv60,20),8),6),2))} & 价格结构排名差与成交量相关性的最小值 \\
+\code{alpha094} & \code{signedpower(rank(vwap-ts_min(vwap,11)),ts_rank(corr(ts_rank(vwap,19),ts_rank(adv60,4),18),2))*-1} & vwap 距历史低点的幂次排名因子 \\
+\code{alpha098} & \code{rank(decay_linear(corr(vwap,sum(adv5,26),4),7))-rank(decay_linear(ts_rank(ts_argmin(corr(rank(O),rank(adv15),20),8),6),8))} & vwap--量相关性与开盘价--量相关性低点排名之差 \\
+\code{alpha101} & \code{(close-open)/(high-low+0.001)} & 日内动量：区间归一化涨跌幅 \\
+\end{longtable}
+\normalsize
+\restoregeometry
+
+\end{document}

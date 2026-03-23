@@ -115,7 +115,7 @@
 
 ## 五、模型建模过程
 
-详见 [MODEL.pdf](./Modeling/MODEL.pdf)。
+详见 [MODEL.md](./Modeling/MODEL.md) 或 [MODEL.pdf](./Modeling/MODEL.pdf)，建议下载到本地查看。
 
 ---
 
